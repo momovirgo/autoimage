@@ -1,635 +1,620 @@
+/* WPLACE AUTO-IMAGE (SHARDED, FIX) – 24/08/2025
+ * - Reutiliza el request real de WPlace (headers/Turnstile + query/body)
+ * - Paleta por getComputedStyle (incluye blanco id=5, excluye solo borrador id=0)
+ * - Reescalado sin suavizado
+ * - Sharding local vía BroadcastChannel para múltiples cuentas/ventanas
+ * Autor: tú + yo :)
+ */
 (async () => {
-/* ===========================
-   Auto-Image-Sharded.js (corrigido)
-   — Multi-cuenta local por SHARDING (módulo)
-   — Paleta robusta + umbrales más permissivos
-   — Validación de imagen + fallback de ID de color → índice
-   — UI movible, resize, selección de posición
-   =========================== */
-
-const CONFIG = {
-  COOLDOWN_DEFAULT: 31000,
-  TRANSPARENCY_THRESHOLD: 10,   // ↓ más permisivo
-  WHITE_THRESHOLD: 245,         // ↓ admite colores claritos
-  LOG_INTERVAL: 10,
-  THEME: {
-    primary: '#000000',
-    secondary: '#111111',
-    accent: '#222222',
-    text: '#ffffff',
-    highlight: '#775ce3',
-    success: '#00ff00',
-    error: '#ff0000',
-    warning: '#ffaa00'
-  }
-};
-
-const TEXTS = {
-  es: {
-    title: "WPlace Auto-Image (Sharded)",
-    initBot: "Iniciar Auto-BOT",
-    uploadImage: "Subir imagen",
-    resizeImage: "Redimensionar imagen",
-    selectPosition: "Seleccionar posición",
-    startPainting: "Iniciar pintura",
-    stopPainting: "Detener",
-    checkingColors: "🔍 Buscando colores disponibles...",
-    noColorsFound: "❌ Abrí la paleta de colores del sitio y probá de nuevo",
-    colorsFound: "✅ {count} colores disponibles",
-    loadingImage: "🖼️ Cargando imagen...",
-    imageLoaded: "✅ Imagen cargada con {count} píxeles válidos",
-    imageError: "❌ Error al cargar la imagen",
-    selectPositionAlert: "Pintá 1 pixel donde querés que empiece el arte",
-    waitingPosition: "👆 Esperando tu pixel de referencia...",
-    positionSet: "✅ Posición definida",
-    positionTimeout: "❌ Tiempo agotado al seleccionar posición",
-    startPaintingMsg: "🎨 Empezando pintura...",
-    paintingProgress: "🧱 Progreso: {painted}/{total} píxeles...",
-    noCharges: "⌛ Sin cargas. Esperando {time}...",
-    paintingStopped: "⏹️ Pintura detenida por el usuario",
-    paintingComplete: "✅ Pintura terminada! {count} píxeles pintados.",
-    paintingError: "❌ Error durante la pintura",
-    missingRequirements: "❌ Cargá una imagen y seleccioná la posición antes",
-    progress: "Progreso",
-    pixels: "Píxeles",
-    charges: "Cargas",
-    estimatedTime: "Tiempo estimado",
-    initMessage: "Clic en 'Iniciar Auto-BOT' para comenzar",
-    waitingInit: "Esperando inicialización...",
-    resizeSuccess: "✅ Imagen redimensionada a {width}x{height}",
-    paintingPaused: "⏸️ Pausa en X: {x}, Y: {y}",
-    keepAspect: "Mantener proporción",
-    width: "Ancho",
-    height: "Alto",
-    apply: "Aplicar",
-    cancel: "Cancelar",
-    minimize: "Minimizar",
-    shardTotal: "Total cuentas",
-    shardSlot: "Tu nº"
-  },
-  en: {
-    title: "WPlace Auto-Image (Sharded)",
-    initBot: "Start Auto-BOT",
-    uploadImage: "Upload Image",
-    resizeImage: "Resize Image",
-    selectPosition: "Select Position",
-    startPainting: "Start Painting",
-    stopPainting: "Stop",
-    checkingColors: "🔍 Checking available colors...",
-    noColorsFound: "❌ Open the site's color palette and try again",
-    colorsFound: "✅ {count} available colors",
-    loadingImage: "🖼️ Loading image...",
-    imageLoaded: "✅ Image loaded with {count} valid pixels",
-    imageError: "❌ Error loading image",
-    selectPositionAlert: "Paint a single pixel where you want the art to start",
-    waitingPosition: "👆 Waiting for your reference pixel...",
-    positionSet: "✅ Position set",
-    positionTimeout: "❌ Timeout when selecting position",
-    startPaintingMsg: "🎨 Starting painting...",
-    paintingProgress: "🧱 Progress: {painted}/{total} pixels...",
-    noCharges: "⌛ No charges. Waiting {time}...",
-    paintingStopped: "⏹️ Painting stopped by user",
-    paintingComplete: "✅ Painting complete! {count} pixels painted.",
-    paintingError: "❌ Error while painting",
-    missingRequirements: "❌ Load an image and select a position first",
-    progress: "Progress",
-    pixels: "Pixels",
-    charges: "Charges",
-    estimatedTime: "Estimated time",
-    initMessage: "Click 'Start Auto-BOT' to begin",
-    waitingInit: "Waiting for initialization...",
-    resizeSuccess: "✅ Image resized to {width}x{height}",
-    paintingPaused: "⏸️ Paused at X: {x}, Y: {y}",
-    keepAspect: "Keep aspect",
-    width: "Width",
-    height: "Height",
-    apply: "Apply",
-    cancel: "Cancel",
-    minimize: "Minimize",
-    shardTotal: "Total accounts",
-    shardSlot: "Your #"
-  }
-};
-
-const state = {
-  running: false,
-  imageLoaded: false,
-  processing: false,
-  totalPixels: 0,
-  paintedPixels: 0,
-  availableColors: [],
-  currentCharges: 0,
-  cooldown: CONFIG.COOLDOWN_DEFAULT,
-  imageData: null,
-  stopFlag: false,
-  colorsChecked: false,
-  startPosition: null,
-  selectingPosition: false,
-  region: null,
-  minimized: false,
-  lastPosition: { x: 0, y: 0 },
-  estimatedTime: 0,
-  language: 'es',
-  // SHARDING
-  totalWorkers: 1,
-  workerSlot: 1
-};
-
-/* ---------- Utils ---------- */
-function detectLanguage(){
-  const userLang = (navigator.language||'es').split('-')[0];
-  state.language = (TEXTS[userLang] ? userLang : 'es');
-}
-const t = (key, params={})=>{
-  let s = (TEXTS[state.language][key] || TEXTS.en[key] || key);
-  for(const [k,v] of Object.entries(params)) s = s.replace(`{${k}}`, v);
-  return s;
-};
-const sleep = ms => new Promise(r=>setTimeout(r,ms));
-const colorDistance = (a,b)=>Math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2);
-function isWhitePixel(r,g,b){ return r>=CONFIG.WHITE_THRESHOLD && g>=CONFIG.WHITE_THRESHOLD && b>=CONFIG.WHITE_THRESHOLD; }
-function formatTime(ms){
-  const s = Math.floor((ms/1000)%60),
-        m = Math.floor((ms/(1000*60))%60),
-        h = Math.floor((ms/(1000*60*60))%24),
-        d = Math.floor(ms/(1000*60*60*24));
-  return (d?d+'d ':'') + (h?h+'h ':'') + (m?m+'m ':'') + s+'s';
-}
-function showAlert(message){
-  const div=document.createElement('div');
-  div.style.cssText = `
-    position:fixed; top:20px; left:50%; transform:translateX(-50%);
-    padding:12px 16px; background:${CONFIG.THEME.accent}; color:${CONFIG.THEME.text};
-    border:1px solid ${CONFIG.THEME.highlight}; border-radius:8px; z-index:10000;
-    box-shadow:0 6px 20px rgba(0,0,0,.45); font:13px/1.3 system-ui,Segoe UI,Roboto,Arial;
-  `;
-  div.textContent = message;
-  document.body.appendChild(div);
-  setTimeout(()=>{ div.style.opacity='0'; div.style.transition='opacity .4s'; setTimeout(()=>div.remove(),400); }, 2200);
-}
-
-/* 🔧 PALETA ROBUSTA (getComputedStyle + múltiples selectores) */
-function extractAvailableColors(){
-  const nodes = document.querySelectorAll(
-    '[id^="color-"], [data-testid^="color-"], [aria-label*="olor"], button[class*="color"]'
-  );
-  const out = [];
-  const seen = new Set();
-
-  nodes.forEach((el, idx) => {
-    let id = null;
-    const m = el.id && el.id.match(/color-(\d+)/i);
-    if (m) id = parseInt(m[1], 10);
-    else if (el.dataset && el.dataset.colorId) id = parseInt(el.dataset.colorId, 10);
-    else id = idx; // fallback por orden en DOM
-
-    const cs = getComputedStyle(el);
-    const bg = cs.backgroundColor || cs.color || '';
-    const mm = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
-    if (!mm) return;
-
-    const rgb = [ +mm[1], +mm[2], +mm[3] ];
-    const key = id + '|' + rgb.join(',');
-    if (seen.has(key)) return;
-    seen.add(key);
-
-    out.push({ id, rgb, el });
-  });
-
-  return out;
-}
-
-function findClosestColor(rgb, palette){
-  return palette.reduce((best,cur)=>{
-    const d = colorDistance(rgb,cur.rgb);
-    return (d<best.d)? {id:cur.id,d} : best;
-  }, {id:palette[0].id, d:colorDistance(rgb,palette[0].rgb)}).id;
-}
-function calculateEstimatedTime(remainingPixels, currentCharges, cooldown){
-  const perCycle = Math.max(currentCharges, 1);
-  const cycles = Math.ceil(Math.max(remainingPixels - currentCharges, 0)/perCycle);
-  return (cycles * cooldown) + (Math.max(remainingPixels-1,0) * 100);
-}
-
-/* ---------- WPlace API ---------- */
-const WPlace = {
-  async paintPixelInRegion(regionX, regionY, pixelX, pixelY, color){
-    try{
-      const res = await fetch(`https://backend.wplace.live/s0/pixel/${regionX}/${regionY}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-        credentials: 'include',
-        body: JSON.stringify({ coords:[pixelX,pixelY], colors:[color] })
-      });
-      const data = await res.json();
-      return data?.painted===1;
-    }catch{ return false; }
-  },
-  async getCharges(){
-    try{
-      const res = await fetch('https://backend.wplace.live/me', { credentials:'include' });
-      const data = await res.json();
-      return { charges: data.charges?.count||0, cooldown: data.charges?.cooldownMs||CONFIG.COOLDOWN_DEFAULT };
-    }catch{
-      return { charges: 0, cooldown: CONFIG.COOLDOWN_DEFAULT };
+  // ------------------ CONFIG ------------------
+  const CONFIG = {
+    COOLDOWN_FALLBACK: 31000,
+    TRANSPARENCY_THRESHOLD: 1,
+    LOG_EVERY: 25,
+    TEAM_CHANNEL_PREFIX: 'wplace-team-',
+    UI_THEME: {
+      bg: '#101014',
+      panel: '#161821',
+      ink: '#e6e6f0',
+      accent: '#7c5cff',
+      warn: '#ffae42',
+      ok: '#00d98b',
+      err: '#ff5a5a',
+      border: '#242637'
     }
-  }
-};
-
-/* ---------- Image Processor ---------- */
-class ImageProcessor{
-  constructor(src){
-    this.img = new Image();
-    this.canvas = document.createElement('canvas');
-    this.ctx = this.canvas.getContext('2d');
-    this.preview = document.createElement('canvas');
-    this.pctx = this.preview.getContext('2d');
-    this.src = src;
-  }
-  async load(){ return new Promise((res,rej)=>{ this.img.onload=()=>{ this.canvas.width=this.img.width; this.canvas.height=this.img.height; this.ctx.drawImage(this.img,0,0); res(); }; this.img.onerror=rej; this.img.src=this.src; }); }
-  getPixelData(){ return this.ctx.getImageData(0,0,this.canvas.width,this.canvas.height).data; }
-  getDimensions(){ return { width:this.canvas.width, height:this.canvas.height }; }
-  resize(w,h){
-    const tmp=document.createElement('canvas'); tmp.width=w; tmp.height=h; const tctx=tmp.getContext('2d');
-    tctx.drawImage(this.img,0,0,w,h);
-    this.canvas.width=w; this.canvas.height=h; this.ctx.drawImage(tmp,0,0);
-    return this.getPixelData();
-  }
-  previewDataURL(w,h){ this.preview.width=w; this.preview.height=h; this.pctx.imageSmoothingEnabled=false; this.pctx.drawImage(this.img,0,0,w,h); return this.preview.toDataURL(); }
-}
-
-/* ---------- UI ---------- */
-function createUI(){
-  detectLanguage();
-
-  const fa=document.createElement('link');
-  fa.rel='stylesheet';
-  fa.href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css';
-  document.head.appendChild(fa);
-
-  const style=document.createElement('style');
-  style.textContent = `
-    @keyframes slideIn { from{transform:translateY(20px);opacity:0} to{transform:translateY(0);opacity:1} }
-    #wplace-image-bot-container {
-      position:fixed; top:20px; right:20px; width:320px; background:${CONFIG.THEME.primary};
-      border:1px solid ${CONFIG.THEME.accent}; border-radius:8px; padding:0; box-shadow:0 5px 15px rgba(0,0,0,0.5);
-      z-index:99998; color:${CONFIG.THEME.text}; font:14px/1.3 system-ui,Segoe UI,Roboto,Arial; overflow:hidden; animation:slideIn .3s ease-out;
-    }
-    .wplace-header { padding:12px 15px; background:${CONFIG.THEME.secondary}; color:${CONFIG.THEME.highlight}; display:flex; justify-content:space-between; align-items:center; cursor:move; user-select:none; }
-    .wplace-content { padding:14px; }
-    .wplace-btn { padding:9px 10px; border:none; border-radius:6px; font-weight:600; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; transition:transform .15s }
-    .wplace-btn:hover{ transform:translateY(-1px) }
-    .wplace-btn-primary { background:${CONFIG.THEME.accent}; color:#fff }
-    .wplace-btn-upload { background:${CONFIG.THEME.secondary}; color:#fff; border:1px dashed ${CONFIG.THEME.text} }
-    .wplace-btn-start { background:${CONFIG.THEME.success}; color:#000 }
-    .wplace-btn-stop { background:${CONFIG.THEME.error}; color:#fff }
-    .wplace-btn-select { background:${CONFIG.THEME.highlight}; color:#000 }
-    .wplace-btn:disabled { opacity:.5; cursor:not-allowed; transform:none }
-    .wplace-progress { width:100%; background:${CONFIG.THEME.secondary}; border-radius:4px; margin:10px 0; overflow:hidden }
-    .wplace-progress-bar { height:10px; background:${CONFIG.THEME.highlight}; transition:width .3s }
-    .wplace-stats { background:${CONFIG.THEME.secondary}; padding:10px; border-radius:6px; margin-bottom:10px; }
-    .row { display:flex; gap:8px; align-items:center; margin:8px 0; flex-wrap:wrap; }
-    label.slab { display:flex; align-items:center; gap:6px; }
-    input.shard { width:74px; padding:6px; border-radius:6px; border:1px solid #444; background:#000; color:#fff }
-    .status { padding:8px; border-radius:4px; text-align:center; font-size:13px; background:rgba(255,255,255,.08) }
-    .resize-container { display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); background:${CONFIG.THEME.primary}; padding:16px; border-radius:8px; z-index:10000; box-shadow:0 0 20px rgba(0,0,0,.5); max-width:90%; max-height:90%; overflow:auto }
-    .resize-overlay { position:fixed; inset:0; background:rgba(0,0,0,.7); display:none; z-index:9999 }
-    .resize-preview { max-width:100%; max-height:300px; margin:10px 0; border:1px solid ${CONFIG.THEME.accent} }
-  `;
-  document.head.appendChild(style);
-
-  const html = `
-    <div class="wplace-header">
-      <div><i class="fa-solid fa-image"></i> ${t('title')}</div>
-      <button id="minimizeBtn" class="wplace-btn" style="background:none;border:none;color:${CONFIG.THEME.text}" title="${t('minimize')}"><i class="fa-solid fa-minus"></i></button>
-    </div>
-    <div class="wplace-content">
-      <div class="row">
-        <button id="initBotBtn"   class="wplace-btn wplace-btn-primary"><i class="fa-solid fa-robot"></i><span>${t('initBot')}</span></button>
-        <button id="uploadBtn"    class="wplace-btn wplace-btn-upload" disabled><i class="fa-solid fa-upload"></i><span>${t('uploadImage')}</span></button>
-      </div>
-      <div class="row">
-        <button id="resizeBtn"    class="wplace-btn wplace-btn-primary" disabled><i class="fa-solid fa-expand"></i><span>${t('resizeImage')}</span></button>
-        <button id="selectPosBtn" class="wplace-btn wplace-btn-select" disabled><i class="fa-solid fa-crosshairs"></i><span>${t('selectPosition')}</span></button>
-      </div>
-
-      <div class="row" style="margin-top:6px">
-        <label class="slab">${t('shardTotal')} <input id="shardTotal" class="shard" type="number" min="1" value="1"></label>
-        <label class="slab">${t('shardSlot')}  <input id="shardSlot"  class="shard" type="number" min="1" value="1"></label>
-      </div>
-
-      <div class="row">
-        <button id="startBtn" class="wplace-btn wplace-btn-start" disabled><i class="fa-solid fa-play"></i><span>${t('startPainting')}</span></button>
-        <button id="stopBtn"  class="wplace-btn wplace-btn-stop"  disabled><i class="fa-solid fa-stop"></i><span>${t('stopPainting')}</span></button>
-      </div>
-
-      <div class="wplace-progress"><div id="progressBar" class="wplace-progress-bar" style="width:0%"></div></div>
-      <div class="wplace-stats"><div id="statsArea"><div>${t('initMessage')}</div></div></div>
-      <div id="statusText" class="status">${t('waitingInit')}</div>
-    </div>
-  `;
-
-  const container = document.createElement('div');
-  container.id='wplace-image-bot-container';
-  container.innerHTML = html;
-  document.body.appendChild(container);
-
-  // drag
-  const header = container.querySelector('.wplace-header');
-  let p1=0,p2=0,p3=0,p4=0;
-  header.onmousedown = (e)=>{ if(e.target.closest('#minimizeBtn')) return;
-    e.preventDefault(); p3=e.clientX; p4=e.clientY;
-    document.onmouseup=()=>{document.onmouseup=null;document.onmousemove=null;};
-    document.onmousemove=(ev)=>{ ev.preventDefault(); p1=p3-ev.clientX; p2=p4-ev.clientY; p3=ev.clientX; p4=ev.clientY;
-      container.style.top=(container.offsetTop-p2)+'px'; container.style.left=(container.offsetLeft-p1)+'px';
-    };
   };
 
-  const resizeOverlay = document.createElement('div'); resizeOverlay.className='resize-overlay';
-  const resizeContainer = document.createElement('div'); resizeContainer.className='resize-container';
-  resizeContainer.innerHTML = `
-    <h3 style="margin:0 0 8px 0">${t('resizeImage')}</h3>
-    <div>
-      <label>${t('width')}: <span id="widthValue">0</span>px <input id="widthSlider" type="range" min="10" max="1000" value="100" style="width:100%"></label>
-      <label>${t('height')}: <span id="heightValue">0</span>px <input id="heightSlider" type="range" min="10" max="1000" value="100" style="width:100%"></label>
-      <label><input id="keepAspect" type="checkbox" checked> ${t('keepAspect')}</label>
-      <img id="resizePreview" class="resize-preview" src="">
-      <div class="row">
-        <button id="confirmResize" class="wplace-btn wplace-btn-primary"><i class="fa-solid fa-check"></i> ${t('apply')}</button>
-        <button id="cancelResize"  class="wplace-btn wplace-btn-stop"><i class="fa-solid fa-xmark"></i> ${t('cancel')}</button>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(resizeOverlay);
-  document.body.appendChild(resizeContainer);
+  // ------------------ STATE ------------------
+  const S = {
+    // ui
+    ready: false,
+    minimized: false,
+    // image
+    imageData: null, // { w, h, pixels:Uint8ClampedArray }
+    scaled: null, // { w,h,pixels }
+    total: 0,
+    painted: 0,
+    // place
+    palette: [],
+    havePalette: false,
+    region: null,         // {rx, ry}
+    anchor: null,         // {ax, ay} pixel top-left
+    lastPos: {x:0, y:0},
+    // charges
+    charges: 0,
+    cooldown: CONFIG.COOLDOWN_FALLBACK,
+    // run
+    running: false,
+    stopFlag: false,
+    // template (captured real request)
+    paintTemplate: null,  // { baseUrl, method, useQueryXY, schema, headers, credentials, mode, contentType }
+    // team
+    teamId: null,
+    role: 'member',       // 'leader' | 'member'
+    shard: null,          // {x0,y0,w,h}
+    channel: null,
+  };
 
-  // refs
-  const minimizeBtn   = container.querySelector('#minimizeBtn');
-  const initBotBtn    = container.querySelector('#initBotBtn');
-  const uploadBtn     = container.querySelector('#uploadBtn');
-  const resizeBtn     = container.querySelector('#resizeBtn');
-  const selectPosBtn  = container.querySelector('#selectPosBtn');
-  const startBtn      = container.querySelector('#startBtn');
-  const stopBtn       = container.querySelector('#stopBtn');
-  const progressBar   = container.querySelector('#progressBar');
-  const statsArea     = container.querySelector('#statsArea');
-  const statusText    = container.querySelector('#statusText');
+  // ------------------ UTILS ------------------
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const fmtTime = (ms) => {
+    const s = Math.floor(ms/1000)%60;
+    const m = Math.floor(ms/60000)%60;
+    const h = Math.floor(ms/3600000);
+    return `${h?`${h}h `:''}${m?`${m}m `:''}${s}s`;
+  };
+  const clamp = (v,min,max)=> Math.max(min, Math.min(max, v));
 
-  const widthSlider   = resizeContainer.querySelector('#widthSlider');
-  const heightSlider  = resizeContainer.querySelector('#heightSlider');
-  const widthValue    = resizeContainer.querySelector('#widthValue');
-  const heightValue   = resizeContainer.querySelector('#heightValue');
-  const keepAspect    = resizeContainer.querySelector('#keepAspect');
-  const resizePreview = resizeContainer.querySelector('#resizePreview');
-  const confirmResize = resizeContainer.querySelector('#confirmResize');
-  const cancelResize  = resizeContainer.querySelector('#cancelResize');
+  // Manhattan distance faster than Euclidean and suficiente para paleta pequeña
+  const colorDist = (a,b) => Math.abs(a[0]-b[0]) + Math.abs(a[1]-b[1]) + Math.abs(a[2]-b[2]);
 
-  const shardTotalInp = container.querySelector('#shardTotal');
-  const shardSlotInp  = container.querySelector('#shardSlot');
-
-  function updateUI(key, type='default', params={}){
-    statusText.textContent = t(key, params);
+  // ------------------ PALETA ------------------
+  function readPalette() {
+    const els = Array.from(document.querySelectorAll('[id^="color-"]'));
+    if (!els.length) return [];
+    const list = [];
+    for (const el of els) {
+      const id = parseInt(el.id.replace('color-',''),10);
+      if (Number.isNaN(id)) continue;
+      if (id === 0) continue;             // solo excluimos borrador
+      // usar estilo computado (no inline) para obtener rgb
+      const rgbStr = getComputedStyle(el).backgroundColor;
+      const m = rgbStr && rgbStr.match(/\d+/g);
+      const rgb = m ? m.slice(0,3).map(Number) : [0,0,0];
+      list.push({id, rgb});
+    }
+    // ordenar por id por si el DOM viene mezclado
+    list.sort((a,b)=>a.id-b.id);
+    return list;
   }
-  async function updateStats(){
-    if(!state.colorsChecked || !state.imageLoaded) return;
-    const {charges, cooldown} = await WPlace.getCharges();
-    state.currentCharges = Math.floor(charges);
-    state.cooldown = cooldown;
 
-    const progress = state.totalPixels? Math.round(100*state.paintedPixels/state.totalPixels):0;
-    const remaining = Math.max(state.totalPixels - state.paintedPixels, 0);
-    state.estimatedTime = calculateEstimatedTime(remaining, state.currentCharges, state.cooldown);
-    progressBar.style.width = progress + '%';
-
-    statsArea.innerHTML = `
-      <div><b>${t('progress')}:</b> ${progress}%</div>
-      <div><b>${t('pixels')}:</b> ${state.paintedPixels}/${state.totalPixels}</div>
-      <div><b>${t('charges')}:</b> ${state.currentCharges}</div>
-      ${state.imageLoaded ? `<div><b>${t('estimatedTime')}:</b> ${formatTime(state.estimatedTime)}</div>`:''}
-      <div><b>Shard:</b> ${state.workerSlot} / ${state.totalWorkers}</div>
-    `;
+  function nearestColorId(rgb) {
+    let best = S.palette[0], bestD = 1e9;
+    for (const c of S.palette) {
+      const d = colorDist(rgb, c.rgb);
+      if (d < bestD) { bestD = d; best = c; }
+    }
+    return best?.id ?? 1;
   }
 
-  minimizeBtn.addEventListener('click', ()=>{
-    state.minimized=!state.minimized;
-    container.querySelector('.wplace-content').style.display = state.minimized?'none':'block';
-    minimizeBtn.innerHTML = state.minimized? '<i class="fa-solid fa-expand"></i>' : '<i class="fa-solid fa-minus"></i>';
-  });
+  // ------------------ CARGAS ------------------
+  async function getCharges() {
+    try {
+      const res = await fetch('https://backend.wplace.live/me', {credentials:'include'});
+      const data = await res.json();
+      S.charges = Math.floor(data?.charges?.count ?? 0);
+      S.cooldown = data?.charges?.cooldownMs ?? CONFIG.COOLDOWN_FALLBACK;
+    } catch {
+      // fallback
+      S.charges = 0;
+      S.cooldown = CONFIG.COOLDOWN_FALLBACK;
+    }
+  }
 
-  initBotBtn.addEventListener('click', async ()=>{
-    try{
-      updateUI('checkingColors','default');
-      state.availableColors = extractAvailableColors();
-      if(state.availableColors.length===0){
-        showAlert(t('noColorsFound'));
-        updateUI('noColorsFound','error');
-        return;
+  // ------------------ CAPTURA REQUEST REAL ------------------
+  // Cuando hagas un click manual en un píxel, clonamos ese request tal cual.
+  function armCaptureOnceForPaintRequest(onCaptured) {
+    const orig = window.fetch;
+    window.fetch = async (url, options) => {
+      try {
+        if (typeof url === 'string' &&
+            url.includes('/s0/pixel/') &&
+            options?.method?.toUpperCase() === 'POST') {
+          const parsed = new URL(url);
+          const m = parsed.pathname.match(/\/s0\/pixel\/(\d+)\/(\d+)/);
+          const rx = m ? parseInt(m[1],10) : null;
+          const ry = m ? parseInt(m[2],10) : null;
+
+          // lee body (string)
+          let bodyText = '';
+          try { bodyText = typeof options.body === 'string' ? options.body : ''; } catch {}
+          let schema = 'unknown';
+          let useQueryXY = false;
+          let contentType = '';
+          try {
+            const h = new Headers(options.headers || {});
+            contentType = h.get('content-type') || '';
+            const qpX = parsed.searchParams.get('x');
+            const qpY = parsed.searchParams.get('y');
+            if (qpX !== null && qpY !== null) useQueryXY = true;
+
+            if (bodyText) {
+              try {
+                const json = JSON.parse(bodyText);
+                if (Array.isArray(json?.coords) && Array.isArray(json?.colors)) schema = 'coordsColors';
+                else if ('x' in json && 'y' in json && 'color' in json) schema = 'xyColor';
+                else if ('color' in json) schema = 'colorOnly';
+              } catch { /* ignore */ }
+            } else {
+              // Algunos clientes mandan solo query + color en header personalizado—lo manejamos luego
+              if (useQueryXY) schema = 'queryOnly';
+            }
+
+            const tpl = {
+              baseUrl: 'https://backend.wplace.live/s0/pixel',
+              method: 'POST',
+              useQueryXY,
+              schema,
+              headers: Array.from(h.entries()),   // guardo como pares
+              credentials: options.credentials || 'include',
+              mode: options.mode || 'cors',
+              contentType,
+              regionFromCapture: (rx!==null&&ry!==null) ? {rx,ry} : null
+            };
+            window.fetch = orig; // restaurar
+            onCaptured(tpl, parsed, options);
+          } catch {
+            window.fetch = orig;
+          }
+        }
+      } finally {
+        return orig(url, options);
       }
-      state.colorsChecked = true;
-      uploadBtn.disabled = false;
-      selectPosBtn.disabled = false;
-      initBotBtn.style.display='none';
-      updateUI('colorsFound','success',{count:state.availableColors.length});
-      updateStats();
-    }catch{ updateUI('imageError','error'); }
-  });
+    };
+  }
 
-  uploadBtn.addEventListener('click', async ()=>{
-    try{
-      updateUI('loadingImage','default');
-      const input=document.createElement('input'); input.type='file'; input.accept='image/png,image/jpeg';
-      input.onchange = async ()=>{
-        const fr=new FileReader();
-        fr.onload = async ()=>{
-          const proc=new ImageProcessor(fr.result);
-          await proc.load();
-          const {width,height} = proc.getDimensions();
-          const pixels = proc.getPixelData();
-          let total=0;
-          for(let y=0;y<height;y++) for(let x=0;x<width;x++){
-            const i=4*(y*width+x); const a=pixels[i+3]; if(a<CONFIG.TRANSPARENCY_THRESHOLD) continue;
-            const r=pixels[i],g=pixels[i+1],b=pixels[i+2]; if(isWhitePixel(r,g,b)) continue; total++;
-          }
+  // ------------------ PINTAR (USANDO LA PLANTILLA) ------------------
+  async function paintOnePixel(regionX, regionY, pixelX, pixelY, colorId) {
+    if (!S.paintTemplate) return {ok:false, status:'no-template'};
+    const tpl = S.paintTemplate;
 
-          /* ⚠️ Validación dura: 0 píxeles válidos */
-          if (!total) {
-            alert("La imagen quedó con 0 píxeles válidos. Abrí la paleta y baja los umbrales (blanco/alpha).");
-          }
+    const headers = new Headers(tpl.headers || []);
+    // Nos aseguramos de content-type coherente si hay body
+    let url = `${tpl.baseUrl}/${regionX}/${regionY}`;
+    let body = null;
 
-          state.imageData = { width,height,pixels,totalPixels:total, processor:proc };
-          state.totalPixels = total; state.paintedPixels=0; state.imageLoaded=true; state.lastPosition={x:0,y:0};
-          resizeBtn.disabled=false; if(state.startPosition) startBtn.disabled=false;
-          updateStats(); updateUI('imageLoaded','success',{count:total});
-        };
-        fr.readAsDataURL(input.files[0]);
+    if (tpl.useQueryXY) {
+      const u = new URL(url);
+      u.searchParams.set('x', String(pixelX));
+      u.searchParams.set('y', String(pixelY));
+      url = u.toString();
+    }
+
+    // Construyo body según el esquema detectado
+    if (tpl.schema === 'coordsColors') {
+      body = JSON.stringify({ coords: [pixelX, pixelY], colors: [colorId] });
+      if (!headers.get('content-type')) headers.set('content-type', 'application/json');
+    } else if (tpl.schema === 'xyColor') {
+      body = JSON.stringify({ x: pixelX, y: pixelY, color: colorId });
+      if (!headers.get('content-type')) headers.set('content-type', 'application/json');
+    } else if (tpl.schema === 'colorOnly') {
+      body = JSON.stringify({ color: colorId });
+      if (!headers.get('content-type')) headers.set('content-type', 'application/json');
+    } else if (tpl.schema === 'queryOnly') {
+      // sin body, color podría ir en header si el server lo usa — probamos en body también
+      body = JSON.stringify({ color: colorId });
+      if (!headers.get('content-type')) headers.set('content-type', 'application/json');
+    } else {
+      // fallback compatible con bots conocidos
+      body = JSON.stringify({ coords: [pixelX, pixelY], colors: [colorId] });
+      if (!headers.get('content-type')) headers.set('content-type', 'application/json');
+    }
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        credentials: tpl.credentials || 'include',
+        mode: tpl.mode || 'cors',
+        headers,
+        body
+      });
+
+      // si es 401/403 puede ser token caducado
+      if (!res.ok) {
+        return {ok:false, status:`http-${res.status}`};
+      }
+      const data = await res.json().catch(()=> ({}));
+      // WPlace devuelve típicamente { painted: 1 }
+      const painted = (data?.painted === 1) || (data?.success === true);
+      return {ok: painted, status: painted ? 'ok' : 'no-painted', data};
+    } catch (e) {
+      return {ok:false, status:'fetch-error'};
+    }
+  }
+
+  // ------------------ IMAGEN ------------------
+  async function pickImage() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/png,image/jpeg';
+    return new Promise((resolve, reject) => {
+      input.onchange = () => {
+        const f = input.files?.[0];
+        if (!f) return reject(new Error('no file'));
+        const fr = new FileReader();
+        fr.onload = () => resolve(fr.result);
+        fr.onerror = reject;
+        fr.readAsDataURL(f);
       };
       input.click();
-    }catch{ updateUI('imageError','error'); }
-  });
-
-  // Resize dialog
-  function openResize(proc){
-    const {width,height} = proc.getDimensions();
-    const AR = width/height;
-    widthSlider.value = width; heightSlider.value = height;
-    widthValue.textContent = width; heightValue.textContent = height;
-    resizePreview.src = proc.img.src;
-    const updatePreview = ()=>{ const w=+widthSlider.value, h=+heightSlider.value; widthValue.textContent=w; heightValue.textContent=h; resizePreview.src = proc.previewDataURL(w,h); };
-    widthSlider.oninput = ()=>{ if(keepAspect.checked){ const w=+widthSlider.value; heightSlider.value = Math.round(w/AR); } updatePreview(); };
-    heightSlider.oninput= ()=>{ if(keepAspect.checked){ const h=+heightSlider.value; widthSlider.value = Math.round(h*AR); } updatePreview(); };
-    confirmResize.onclick = ()=>{
-      const w=+widthSlider.value, h=+heightSlider.value;
-      const px = proc.resize(w,h);
-      let total=0;
-      for(let y=0;y<h;y++) for(let x=0;x<w;x++){
-        const i=4*(y*w+x), a=px[i+3]; if(a<CONFIG.TRANSPARENCY_THRESHOLD) continue;
-        const r=px[i],g=px[i+1],b=px[i+2]; if(isWhitePixel(r,g,b)) continue; total++;
-      }
-
-      /* ⚠️ Validación dura: 0 píxeles válidos */
-      if (!total) {
-        alert("Con este tamaño hay 0 píxeles válidos. Probá otro tamaño o baja WHITE_THRESHOLD/TRANSPARENCY_THRESHOLD.");
-      }
-
-      state.imageData.pixels=px; state.imageData.width=w; state.imageData.height=h; state.imageData.totalPixels=total;
-      state.totalPixels=total; state.paintedPixels=0;
-      updateStats(); updateUI('resizeSuccess','success',{width:w,height:h});
-      resizeOverlay.style.display='none'; resizeContainer.style.display='none';
-    };
-    cancelResize.onclick = ()=>{ resizeOverlay.style.display='none'; resizeContainer.style.display='none'; };
-    resizeOverlay.style.display='block'; resizeContainer.style.display='block';
+    });
   }
-  resizeBtn.addEventListener('click', ()=>{ if(state.imageLoaded && state.imageData.processor) openResize(state.imageData.processor); });
 
-  // Select position (intercept fetch)
-  selectPosBtn.addEventListener('click', async ()=>{
-    if(state.selectingPosition) return;
-    state.selectingPosition = true; state.startPosition=null; state.region=null; startBtn.disabled=true;
-    showAlert(t('selectPositionAlert')); updateUI('waitingPosition','default');
-    const originalFetch = window.fetch;
-    window.fetch = async (url, options)=>{
-      if(typeof url==='string' && url.includes('https://backend.wplace.live/s0/pixel/') && options?.method?.toUpperCase()==='POST'){
-        try{
-          const res = await originalFetch(url, options);
-          const clone = res.clone(); const data = await clone.json();
-          if(data?.painted===1){
-            const m=url.match(/\/pixel\/(\d+)\/(\d+)/);
-            if(m){ state.region={x:parseInt(m[1]), y:parseInt(m[2])}; }
-            const body=JSON.parse(options.body||'{}');
-            if(body?.coords){ state.startPosition={x:body.coords[0], y:body.coords[1]}; state.lastPosition={x:0,y:0}; }
-            window.fetch=originalFetch; state.selectingPosition=false; updateUI('positionSet','success');
-            if(state.imageLoaded) startBtn.disabled=false;
+  async function loadImageToPixels(dataUrl) {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    await new Promise((res, rej)=> {
+      img.onload = res;
+      img.onerror = rej;
+      img.src = dataUrl;
+    });
+    // Canvas base (sin suavizado)
+    const c = document.createElement('canvas');
+    c.width = img.width; c.height = img.height;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(img, 0, 0);
+
+    const { data } = ctx.getImageData(0,0,c.width,c.height);
+    return { w: c.width, h: c.height, pixels: data };
+  }
+
+  function scaleNearest(src, W, H) {
+    // Reescalado nearest-neighbor (sin suavizado)
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.imageSmoothingEnabled = false;
+
+    const tmp = document.createElement('canvas');
+    tmp.width = src.w; tmp.height = src.h;
+    const tctx = tmp.getContext('2d', { willReadFrequently: true });
+    tctx.imageSmoothingEnabled = false;
+
+    const imgData = new ImageData(new Uint8ClampedArray(src.pixels), src.w, src.h);
+    tctx.putImageData(imgData, 0, 0);
+    ctx.drawImage(tmp, 0,0,src.w,src.h, 0,0,W,H);
+
+    const out = ctx.getImageData(0,0,W,H).data;
+    return { w: W, h: H, pixels: out };
+  }
+
+  // ------------------ UI ------------------
+  function buildUI() {
+    const box = document.createElement('div');
+    box.style.cssText = `
+      position: fixed; z-index: 999999; top: 20px; right: 20px;
+      width: 340px; background: ${CONFIG.UI_THEME.panel}; color: ${CONFIG.UI_THEME.ink};
+      border: 1px solid ${CONFIG.UI_THEME.border}; border-radius: 10px; font-family: ui-sans-serif, system-ui, sans-serif;
+      box-shadow: 0 6px 20px rgba(0,0,0,.45); overflow: hidden;
+    `;
+    box.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;background:${CONFIG.UI_THEME.bg};padding:10px 12px;">
+        <div style="font-weight:700">WPlace Auto-Image (Sharded • FIX)</div>
+        <div>
+          <button id="wp-min" style="background:none;border:none;color:${CONFIG.UI_THEME.ink};cursor:pointer">—</button>
+        </div>
+      </div>
+      <div id="wp-body" style="padding:12px;display:block">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+          <input id="wp-team" placeholder="Team ID" style="grid-column:span 2;padding:8px;border:1px solid ${CONFIG.UI_THEME.border};background:#0e0f13;color:${CONFIG.UI_THEME.ink};border-radius:8px">
+          <button id="wp-join" style="padding:8px;border-radius:8px;border:1px solid ${CONFIG.UI_THEME.border};background:#151725;color:${CONFIG.UI_THEME.ink};cursor:pointer">Unirse al equipo</button>
+          <button id="wp-lead" style="padding:8px;border-radius:8px;border:1px solid ${CONFIG.UI_THEME.border};background:${CONFIG.UI_THEME.accent};color:#fff;cursor:pointer">Soy líder</button>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+          <button id="wp-check" style="padding:8px;border-radius:8px;border:1px solid ${CONFIG.UI_THEME.border};background:#151725;color:${CONFIG.UI_THEME.ink};cursor:pointer">Detectar paleta</button>
+          <button id="wp-load" style="padding:8px;border-radius:8px;border:1px solid ${CONFIG.UI_THEME.border};background:#151725;color:${CONFIG.UI_THEME.ink};cursor:pointer">Subir imagen</button>
+          <label style="display:flex;gap:6px;align-items:center;grid-column:span 2">
+            W:<input id="wp-w" type="number" min="1" value="64" style="width:80px;padding:6px;border-radius:8px;border:1px solid ${CONFIG.UI_THEME.border};background:#0e0f13;color:${CONFIG.UI_THEME.ink}">
+            H:<input id="wp-h" type="number" min="1" value="64" style="width:80px;padding:6px;border-radius:8px;border:1px solid ${CONFIG.UI_THEME.border};background:#0e0f13;color:${CONFIG.UI_THEME.ink}">
+            <button id="wp-res" style="margin-left:auto;padding:8px;border-radius:8px;border:1px solid ${CONFIG.UI_THEME.border};background:#151725;color:${CONFIG.UI_THEME.ink};cursor:pointer">Redimensionar</button>
+          </label>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+          <button id="wp-anchor" style="padding:8px;border-radius:8px;border:1px solid ${CONFIG.UI_THEME.border};background:${CONFIG.UI_THEME.warn};color:#111;cursor:pointer">Elegir posición (haz 1 click)</button>
+          <button id="wp-start" style="padding:8px;border-radius:8px;border:1px solid ${CONFIG.UI_THEME.border};background:${CONFIG.UI_THEME.ok};color:#111;cursor:pointer" disabled>Iniciar</button>
+          <button id="wp-stop" style="padding:8px;border-radius:8px;border:1px solid ${CONFIG.UI_THEME.border};background:${CONFIG.UI_THEME.err};color:#111;cursor:pointer" disabled>Parar</button>
+        </div>
+
+        <div id="wp-status" style="font-size:12px;opacity:.9;line-height:1.5"></div>
+        <div id="wp-progress" style="height:8px;background:#1d1f2b;border-radius:6px;overflow:hidden;margin-top:8px">
+          <div id="wp-bar" style="width:0%;height:100%;background:${CONFIG.UI_THEME.accent}"></div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(box);
+
+    const body = box.querySelector('#wp-body');
+    box.querySelector('#wp-min').onclick = () => {
+      S.minimized = !S.minimized;
+      body.style.display = S.minimized ? 'none' : 'block';
+    };
+
+    // refs
+    const elTeam = box.querySelector('#wp-team');
+    const elJoin = box.querySelector('#wp-join');
+    const elLead = box.querySelector('#wp-lead');
+    const elCheck = box.querySelector('#wp-check');
+    const elLoad = box.querySelector('#wp-load');
+    const elW = box.querySelector('#wp-w');
+    const elH = box.querySelector('#wp-h');
+    const elRes = box.querySelector('#wp-res');
+    const elAnchor = box.querySelector('#wp-anchor');
+    const elStart = box.querySelector('#wp-start');
+    const elStop = box.querySelector('#wp-stop');
+    const elStatus = box.querySelector('#wp-status');
+    const elBar = box.querySelector('#wp-bar');
+
+    function status(html) { elStatus.innerHTML = html; }
+    function setBar(p) { elBar.style.width = `${clamp(p,0,100)}%`; }
+
+    // ---- Team
+    elJoin.onclick = () => {
+      const id = (elTeam.value||'').trim();
+      if (!id) { alert('Pon un Team ID'); return; }
+      S.teamId = id;
+      S.channel = new BroadcastChannel(CONFIG.TEAM_CHANNEL_PREFIX + id);
+      S.channel.onmessage = onTeamMsg;
+      status(`✅ Unido al equipo <b>${id}</b>. Ahora puedes ser líder o esperar shards.`);
+    };
+    elLead.onclick = () => {
+      if (!S.channel) { alert('Primero “Unirse al equipo”'); return; }
+      S.role = 'leader';
+      status(`⭐ Modo líder activo. Sube imagen, detecta paleta y elige posición.`);
+    };
+
+    // ---- Paleta
+    elCheck.onclick = () => {
+      S.palette = readPalette();
+      S.havePalette = S.palette.length > 0;
+      status(S.havePalette
+        ? `🎨 Paleta detectada: ${S.palette.length} colores`
+        : `❌ Abre la paleta de colores en el sitio y vuelve a intentar`);
+    };
+
+    // ---- Imagen
+    elLoad.onclick = async () => {
+      try {
+        const dataUrl = await pickImage();
+        S.imageData = await loadImageToPixels(dataUrl);
+        S.scaled = S.imageData;
+        S.total = countDrawablePixels(S.scaled);
+        S.painted = 0;
+        setBar(0);
+        status(`🖼️ Imagen cargada ${S.scaled.w}×${S.scaled.h}. Pixels a pintar: ${S.total}`);
+      } catch {
+        status(`❌ Error al cargar imagen`);
+      }
+    };
+    elRes.onclick = () => {
+      if (!S.imageData) { alert('Primero sube una imagen'); return; }
+      const W = Math.max(1, parseInt(elW.value||'0',10));
+      const H = Math.max(1, parseInt(elH.value||'0',10));
+      S.scaled = scaleNearest(S.imageData, W, H);
+      S.total = countDrawablePixels(S.scaled);
+      S.painted = 0;
+      setBar(0);
+      status(`🔧 Redimensionado a ${W}×${H}. Pixels a pintar: ${S.total}`);
+    };
+
+    // ---- Anchor (captura template)
+    elAnchor.onclick = () => {
+      alert('PINTA 1 PIXEL A MANO donde vaya la ESQUINA SUPERIOR IZQUIERDA.\nVoy a copiar el request real para usar tu mismo token.');
+      armCaptureOnceForPaintRequest((tpl, parsedUrl, opts) => {
+        S.paintTemplate = tpl;
+        // región desde URL capturada
+        const mm = parsedUrl.pathname.match(/\/s0\/pixel\/(\d+)\/(\d+)/);
+        if (mm) {
+          S.region = { rx: parseInt(mm[1],10), ry: parseInt(mm[2],10) };
+        }
+        // extrae coords del click de referencia
+        let ax = null, ay = null;
+        if (tpl.useQueryXY) {
+          ax = parseInt(parsedUrl.searchParams.get('x'),10);
+          ay = parseInt(parsedUrl.searchParams.get('y'),10);
+        } else {
+          try {
+            const bodyText = typeof opts.body === 'string' ? opts.body : '';
+            const j = bodyText ? JSON.parse(bodyText) : null;
+            if (j) {
+              if (Array.isArray(j.coords)) { ax = j.coords[0]; ay = j.coords[1]; }
+              else if ('x' in j && 'y' in j) { ax = j.x; ay = j.y; }
+            }
+          } catch {}
+        }
+        if (ax!=null && ay!=null) {
+          S.anchor = { ax, ay };
+          status(`📌 Posición definida. Región [${S.region.rx},${S.region.ry}] • Ancla (${ax},${ay}) • schema=${tpl.schema} ${tpl.useQueryXY?'(queryXY)':''}`);
+          elStart.disabled = !S.havePalette || !S.scaled;
+        } else {
+          alert('No pude leer las coordenadas del click. Repite el “Elegir posición”.');
+        }
+      });
+    };
+
+    // ---- RUN
+    elStart.onclick = async () => {
+      if (!S.havePalette || !S.scaled || !S.anchor || !S.region || !S.paintTemplate) {
+        alert('Falta paleta, imagen, posición o template de pintado.');
+        return;
+      }
+      S.running = true; S.stopFlag = false;
+      elStart.disabled = true; elStop.disabled = false;
+      // si líder, distribuir shards
+      if (S.role === 'leader' && S.channel) {
+        const N = 1; // se autocalcula por viewers, pero usamos dinámica: quien se una recibe shard
+        // Enviamos metaframe de imagen a todos: dims y preview mínima
+        S.channel.postMessage({t:'meta', w:S.scaled.w, h:S.scaled.h});
+        // El líder también se auto-asigna un shard después
+      }
+      runLoop(status, setBar).finally(()=>{
+        elStop.disabled = true; elStart.disabled = false;
+      });
+    };
+    elStop.onclick = () => {
+      S.stopFlag = true;
+    };
+
+    S.ready = true;
+    status('Listo. Recuerda: detecta paleta → sube/ajusta imagen → elige posición (1 click) → Iniciar.');
+  }
+
+  // ------------------ TEAM MESSAGING ------------------
+  function onTeamMsg(ev) {
+    const m = ev.data;
+    if (!m || !m.t) return;
+    if (m.t === 'meta') {
+      // el líder anuncia dimensiones; cada miembro pide shard
+      if (S.role !== 'leader') {
+        // pido shard
+        S.channel.postMessage({t:'needShard'});
+      }
+    } else if (m.t === 'giveShard' && S.role !== 'leader') {
+      S.shard = m.shard; // {x0,y0,w,h}
+    } else if (m.t === 'templateUpdate') {
+      // por si líder recaptura headers/turnstile
+      S.paintTemplate = m.tpl;
+    }
+  }
+
+  // En líder: al recibir needShard, asignar siguiente bloque
+  if (!window.__WPLACE_SHARD_ASSIGNER__) {
+    window.__WPLACE_SHARD_ASSIGNER__ = { next: {x0:0,y0:0} };
+  }
+  function assignNextShard(totalW, totalH) {
+    // Strategy: columnas por filas de 1px de alto? mejor bloques horizontales
+    const stripeH = Math.max(1, Math.floor(totalH / 4)); // 4 franjas por defecto
+    const s = window.__WPLACE_SHARD_ASSIGNER__;
+    const shard = { x0: 0, y0: s.next.y0, w: totalW, h: Math.min(stripeH, totalH - s.next.y0) };
+    s.next.y0 += shard.h;
+    return shard.h > 0 ? shard : null;
+  }
+
+  // ------------------ CONTEO PIXELS DIBUJABLES ------------------
+  function countDrawablePixels(buf) {
+    const { w,h,pixels } = buf;
+    let cnt = 0;
+    for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
+      const idx = (y*w + x)*4;
+      const a = pixels[idx+3];
+      if (a < CONFIG.TRANSPARENCY_THRESHOLD) continue;
+      // ya NO saltamos el blanco: se pinta con id=5 si corresponde
+      cnt++;
+    }
+    return cnt;
+  }
+
+  // ------------------ LOOP PRINCIPAL ------------------
+  async function runLoop(status, setBar) {
+    const regionX = S.region.rx;
+    const regionY = S.region.ry;
+    const baseAx = S.anchor.ax;
+    const baseAy = S.anchor.ay;
+
+    // shard actual
+    let x0=0,y0=0,W=S.scaled.w,H=S.scaled.h;
+    if (S.role === 'leader' && S.channel) {
+      // atender solicitudes de shards
+      const handler = (ev) => {
+        const m = ev.data;
+        if (m?.t === 'needShard') {
+          const sh = assignNextShard(S.scaled.w, S.scaled.h);
+          if (sh) S.channel.postMessage({t:'giveShard', shard: sh});
+        }
+      };
+      S.channel.addEventListener('message', handler);
+      // el líder también se pinta su propia franja inicial:
+      const myShard = assignNextShard(S.scaled.w, S.scaled.h) || {x0:0,y0:0,w:S.scaled.w,h:S.scaled.h};
+      x0=myShard.x0; y0=myShard.y0; W=myShard.w; H=myShard.h;
+    } else if (S.shard) {
+      x0=S.shard.x0; y0=S.shard.y0; W=S.shard.w; H=S.shard.h;
+    }
+
+    status(`🎨 Pintando shard x0=${x0}, y0=${y0}, w=${W}, h=${H}…`);
+
+    // recorrido fila-columna
+    for (let y=0; y<H; y++) {
+      for (let x=0; x<W; x++) {
+        if (S.stopFlag) { status(`⏸️ Pausado en (${x0+x}, ${y0+y})`); return; }
+        const idx = ((y0+y)*S.scaled.w + (x0+x))*4;
+        const r = S.scaled.pixels[idx];
+        const g = S.scaled.pixels[idx+1];
+        const b = S.scaled.pixels[idx+2];
+        const a = S.scaled.pixels[idx+3];
+        if (a < CONFIG.TRANSPARENCY_THRESHOLD) continue;
+
+        const colorId = nearestColorId([r,g,b]);
+
+        // charges
+        if (S.charges <= 0) {
+          await getCharges();
+          if (S.charges <= 0) {
+            status(`⌛ Sin cargas. Esperando ${fmtTime(S.cooldown)}…`);
+            await sleep(S.cooldown);
+            await getCharges();
           }
-          return res;
-        }catch{ return originalFetch(url,options); }
-      }
-      return originalFetch(url,options);
-    };
-    setTimeout(()=>{ if(state.selectingPosition){ window.fetch=originalFetch; state.selectingPosition=false; updateUI('positionTimeout','error'); showAlert(t('positionTimeout')); } }, 120000);
-  });
-
-  // Sharding inputs
-  shardTotalInp.addEventListener('change', ()=>{
-    state.totalWorkers = Math.max(1, parseInt(shardTotalInp.value)||1);
-    if(state.workerSlot>state.totalWorkers) { state.workerSlot=state.totalWorkers; shardSlotInp.value=state.workerSlot; }
-    updateStats();
-  });
-  shardSlotInp.addEventListener('change', ()=>{
-    state.workerSlot = Math.max(1, Math.min(state.totalWorkers, parseInt(shardSlotInp.value)||1));
-    updateStats();
-  });
-
-  // Start/stop
-  startBtn.addEventListener('click', async ()=>{
-    if(!state.imageLoaded || !state.startPosition || !state.region){ updateUI('missingRequirements','error'); return; }
-    state.running=true; state.stopFlag=false;
-    startBtn.disabled=true; stopBtn.disabled=false; uploadBtn.disabled=true; selectPosBtn.disabled=true; resizeBtn.disabled=true;
-    updateUI('startPaintingMsg','success');
-    try{ await processImage(); }catch{ updateUI('paintingError','error'); }
-    finally{
-      state.running=false; stopBtn.disabled=true;
-      if(!state.stopFlag){ startBtn.disabled=true; uploadBtn.disabled=false; selectPosBtn.disabled=false; resizeBtn.disabled=false; }
-      else{ startBtn.disabled=false; }
-    }
-  });
-  stopBtn.addEventListener('click', ()=>{ state.stopFlag=true; state.running=false; stopBtn.disabled=true; updateUI('paintingStopped','warning'); });
-
-  // initial stats
-  updateStats();
-
-  // minimize state
-  const content = container.querySelector('.wplace-content');
-  minimizeBtn.addEventListener('click', ()=>{
-    state.minimized=!state.minimized;
-    content.style.display = state.minimized?'none':'block';
-    minimizeBtn.innerHTML = state.minimized? '<i class="fa-solid fa-expand"></i>' : '<i class="fa-solid fa-minus"></i>';
-  });
-}
-
-/* ---------- Core painting with SHARDING + color fallback ---------- */
-async function processImage(){
-  const {width,height,pixels} = state.imageData;
-  const {x:startX, y:startY} = state.startPosition;
-  const {x:regionX, y:regionY} = state.region;
-
-  let startRow = state.lastPosition.y||0;
-  let startCol = state.lastPosition.x||0;
-  let validIdx = 0; // índice global de píxeles válidos (compartido por configuración idéntica)
-
-  outer:
-  for(let y=startRow; y<height; y++){
-    for(let x=(y===startRow? startCol:0); x<width; x++){
-      if(state.stopFlag){ state.lastPosition={x,y}; updateUI('paintingPaused','warning',{x,y}); break outer; }
-
-      const i=4*(y*width+x);
-      const r=pixels[i], g=pixels[i+1], b=pixels[i+2], a=pixels[i+3];
-      if(a<CONFIG.TRANSPARENCY_THRESHOLD) continue;
-      if(isWhitePixel(r,g,b)) continue;
-
-      // SHARD FILTER
-      validIdx++;
-      if( (validIdx-1) % state.totalWorkers !== (state.workerSlot-1) ){
-        continue; // este pixel lo pinta otra de tus cuentas
-      }
-
-      // Charges
-      if(state.currentCharges < 1){
-        updateUI('noCharges','warning',{time:formatTime(state.cooldown)});
-        await sleep(state.cooldown);
-        const upd = await WPlace.getCharges();
-        state.currentCharges = Math.floor(upd.charges); state.cooldown = upd.cooldown;
-      }
-
-      // Elegir color y pintar con fallback por índice
-      const colorId = findClosestColor([r,g,b], state.availableColors);
-      const px = startX + x, py = startY + y;
-
-      let success = await WPlace.paintPixelInRegion(regionX, regionY, px, py, colorId);
-
-      if (!success) {
-        const orderIndex = state.availableColors.findIndex(c => c.id === colorId);
-        if (orderIndex >= 0) {
-          success = await WPlace.paintPixelInRegion(regionX, regionY, px, py, orderIndex);
         }
-      }
 
-      if(success){
-        state.paintedPixels++;
-        state.currentCharges = Math.max(0, state.currentCharges-1);
-        if(state.paintedPixels % CONFIG.LOG_INTERVAL===0){
-          await updateStats();
-          updateUI('paintingProgress','default',{painted:state.paintedPixels,total:state.totalPixels});
+        const ok = await paintOnePixel(regionX, regionY, baseAx + x0 + x, baseAy + y0 + y, colorId);
+        if (ok.ok) {
+          S.painted++; S.charges--;
+          if ((S.painted % CONFIG.LOG_EVERY) === 0) {
+            const p = Math.round(100 * S.painted / S.total);
+            setBar(p);
+            status(`🧱 Progreso ${S.painted}/${S.total} (${p}%)`);
+          }
+        } else {
+          // Si falla por token (403), pedimos recaptura
+          if (/http-40[13]/.test(ok.status)) {
+            status(`🔒 Token vencido. Haz 1 click manual para recapturar…`);
+            if (S.channel && S.role === 'leader') {
+              // avisar a miembros (opcional)
+              S.channel.postMessage({t:'needRecapture'});
+            }
+            await new Promise(res => {
+              armCaptureOnceForPaintRequest((tpl) => {
+                S.paintTemplate = tpl;
+                // broadcast nueva plantilla
+                if (S.channel && S.role === 'leader') {
+                  S.channel.postMessage({t:'templateUpdate', tpl});
+                }
+                res();
+              });
+            });
+            // reintenta una vez
+            const retry = await paintOnePixel(regionX, regionY, baseAx + x0 + x, baseAy + y0 + y, colorId);
+            if (!retry.ok) {
+              // si sigue mal, avanza para no bloquear
+              await sleep(150);
+            }
+          } else {
+            // otros errores: avanzar
+            await sleep(100);
+          }
         }
       }
     }
+
+    setBar(100);
+    status(`✅ Shard terminado. Pintados: ${S.painted}.`);
   }
 
-  if(state.stopFlag){ updateUI('paintingStopped','warning'); }
-  else{ updateUI('paintingComplete','success',{count:state.paintedPixels}); state.lastPosition={x:0,y:0}; }
-  await updateStats();
-}
-
-/* ---------- boot ---------- */
-createUI();
+  // ------------------ START ------------------
+  buildUI();
+  // Autodetect paleta al abrir UI para que no te olvides
+  S.palette = readPalette();
+  S.havePalette = S.palette.length > 0;
 
 })();
