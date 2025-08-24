@@ -1,15 +1,16 @@
 (async () => {
 /* ===========================
-   Auto-Image-Sharded.js
-   — WPlace Auto-Image multi-cuenta por SHARDING (módulo)
-   — Basado en tu Auto-Image (UI, API real, drag, resize)
-   — Todas las cuentas en la misma PC; sin coordinación externa
+   Auto-Image-Sharded.js (corrigido)
+   — Multi-cuenta local por SHARDING (módulo)
+   — Paleta robusta + umbrales más permissivos
+   — Validación de imagen + fallback de ID de color → índice
+   — UI movible, resize, selección de posición
    =========================== */
 
 const CONFIG = {
   COOLDOWN_DEFAULT: 31000,
-  TRANSPARENCY_THRESHOLD: 100,
-  WHITE_THRESHOLD: 250,
+  TRANSPARENCY_THRESHOLD: 10,   // ↓ más permisivo
+  WHITE_THRESHOLD: 245,         // ↓ admite colores claritos
   LOG_INTERVAL: 10,
   THEME: {
     primary: '#000000',
@@ -154,7 +155,7 @@ function formatTime(ms){
         d = Math.floor(ms/(1000*60*60*24));
   return (d?d+'d ':'') + (h?h+'h ':'') + (m?m+'m ':'') + s+'s';
 }
-function showAlert(message, type='info'){
+function showAlert(message){
   const div=document.createElement('div');
   div.style.cssText = `
     position:fixed; top:20px; left:50%; transform:translateX(-50%);
@@ -166,18 +167,38 @@ function showAlert(message, type='info'){
   document.body.appendChild(div);
   setTimeout(()=>{ div.style.opacity='0'; div.style.transition='opacity .4s'; setTimeout(()=>div.remove(),400); }, 2200);
 }
+
+/* 🔧 PALETA ROBUSTA (getComputedStyle + múltiples selectores) */
 function extractAvailableColors(){
-  const colorElements = document.querySelectorAll('[id^="color-"]');
-  return Array.from(colorElements)
-    .filter(el=>!el.querySelector('svg'))
-    .filter(el=>{ const id = parseInt(el.id.replace('color-','')); return id!==0 && id!==5; })
-    .map(el=>{
-      const id = parseInt(el.id.replace('color-',''));
-      const rgbStr = el.style.backgroundColor.match(/\d+/g);
-      const rgb = rgbStr ? rgbStr.map(Number) : [0,0,0];
-      return { id, rgb };
-    });
+  const nodes = document.querySelectorAll(
+    '[id^="color-"], [data-testid^="color-"], [aria-label*="olor"], button[class*="color"]'
+  );
+  const out = [];
+  const seen = new Set();
+
+  nodes.forEach((el, idx) => {
+    let id = null;
+    const m = el.id && el.id.match(/color-(\d+)/i);
+    if (m) id = parseInt(m[1], 10);
+    else if (el.dataset && el.dataset.colorId) id = parseInt(el.dataset.colorId, 10);
+    else id = idx; // fallback por orden en DOM
+
+    const cs = getComputedStyle(el);
+    const bg = cs.backgroundColor || cs.color || '';
+    const mm = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+    if (!mm) return;
+
+    const rgb = [ +mm[1], +mm[2], +mm[3] ];
+    const key = id + '|' + rgb.join(',');
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    out.push({ id, rgb, el });
+  });
+
+  return out;
 }
+
 function findClosestColor(rgb, palette){
   return palette.reduce((best,cur)=>{
     const d = colorDistance(rgb,cur.rgb);
@@ -400,7 +421,7 @@ function createUI(){
       updateUI('checkingColors','default');
       state.availableColors = extractAvailableColors();
       if(state.availableColors.length===0){
-        showAlert(t('noColorsFound'),'error');
+        showAlert(t('noColorsFound'));
         updateUI('noColorsFound','error');
         return;
       }
@@ -429,6 +450,12 @@ function createUI(){
             const i=4*(y*width+x); const a=pixels[i+3]; if(a<CONFIG.TRANSPARENCY_THRESHOLD) continue;
             const r=pixels[i],g=pixels[i+1],b=pixels[i+2]; if(isWhitePixel(r,g,b)) continue; total++;
           }
+
+          /* ⚠️ Validación dura: 0 píxeles válidos */
+          if (!total) {
+            alert("La imagen quedó con 0 píxeles válidos. Abrí la paleta y baja los umbrales (blanco/alpha).");
+          }
+
           state.imageData = { width,height,pixels,totalPixels:total, processor:proc };
           state.totalPixels = total; state.paintedPixels=0; state.imageLoaded=true; state.lastPosition={x:0,y:0};
           resizeBtn.disabled=false; if(state.startPosition) startBtn.disabled=false;
@@ -458,6 +485,12 @@ function createUI(){
         const i=4*(y*w+x), a=px[i+3]; if(a<CONFIG.TRANSPARENCY_THRESHOLD) continue;
         const r=px[i],g=px[i+1],b=px[i+2]; if(isWhitePixel(r,g,b)) continue; total++;
       }
+
+      /* ⚠️ Validación dura: 0 píxeles válidos */
+      if (!total) {
+        alert("Con este tamaño hay 0 píxeles válidos. Probá otro tamaño o baja WHITE_THRESHOLD/TRANSPARENCY_THRESHOLD.");
+      }
+
       state.imageData.pixels=px; state.imageData.width=w; state.imageData.height=h; state.imageData.totalPixels=total;
       state.totalPixels=total; state.paintedPixels=0;
       updateStats(); updateUI('resizeSuccess','success',{width:w,height:h});
@@ -468,11 +501,11 @@ function createUI(){
   }
   resizeBtn.addEventListener('click', ()=>{ if(state.imageLoaded && state.imageData.processor) openResize(state.imageData.processor); });
 
-  // Select position (intercept fetch as en tu script)
+  // Select position (intercept fetch)
   selectPosBtn.addEventListener('click', async ()=>{
     if(state.selectingPosition) return;
     state.selectingPosition = true; state.startPosition=null; state.region=null; startBtn.disabled=true;
-    showAlert(t('selectPositionAlert'),'info'); updateUI('waitingPosition','default');
+    showAlert(t('selectPositionAlert')); updateUI('waitingPosition','default');
     const originalFetch = window.fetch;
     window.fetch = async (url, options)=>{
       if(typeof url==='string' && url.includes('https://backend.wplace.live/s0/pixel/') && options?.method?.toUpperCase()==='POST'){
@@ -492,7 +525,7 @@ function createUI(){
       }
       return originalFetch(url,options);
     };
-    setTimeout(()=>{ if(state.selectingPosition){ window.fetch=originalFetch; state.selectingPosition=false; updateUI('positionTimeout','error'); showAlert(t('positionTimeout'),'error'); } }, 120000);
+    setTimeout(()=>{ if(state.selectingPosition){ window.fetch=originalFetch; state.selectingPosition=false; updateUI('positionTimeout','error'); showAlert(t('positionTimeout')); } }, 120000);
   });
 
   // Sharding inputs
@@ -533,7 +566,7 @@ function createUI(){
   });
 }
 
-/* ---------- Core painting with SHARDING ---------- */
+/* ---------- Core painting with SHARDING + color fallback ---------- */
 async function processImage(){
   const {width,height,pixels} = state.imageData;
   const {x:startX, y:startY} = state.startPosition;
@@ -541,7 +574,7 @@ async function processImage(){
 
   let startRow = state.lastPosition.y||0;
   let startCol = state.lastPosition.x||0;
-  let validIdx = 0; // índice global de píxeles válidos (misma imagen/filtros en todas)
+  let validIdx = 0; // índice global de píxeles válidos (compartido por configuración idéntica)
 
   outer:
   for(let y=startRow; y<height; y++){
@@ -567,10 +600,20 @@ async function processImage(){
         state.currentCharges = Math.floor(upd.charges); state.cooldown = upd.cooldown;
       }
 
+      // Elegir color y pintar con fallback por índice
       const colorId = findClosestColor([r,g,b], state.availableColors);
       const px = startX + x, py = startY + y;
-      const ok = await WPlace.paintPixelInRegion(regionX, regionY, px, py, colorId);
-      if(ok){
+
+      let success = await WPlace.paintPixelInRegion(regionX, regionY, px, py, colorId);
+
+      if (!success) {
+        const orderIndex = state.availableColors.findIndex(c => c.id === colorId);
+        if (orderIndex >= 0) {
+          success = await WPlace.paintPixelInRegion(regionX, regionY, px, py, orderIndex);
+        }
+      }
+
+      if(success){
         state.paintedPixels++;
         state.currentCharges = Math.max(0, state.currentCharges-1);
         if(state.paintedPixels % CONFIG.LOG_INTERVAL===0){
