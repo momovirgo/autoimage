@@ -1,203 +1,359 @@
-(()=>{
-// Auto-Image-MA-Leader.js — Multi-Account Leader for wplace.live
-// Basado en la idea de bookmarklet del repo público; UI mínima + BroadcastChannel.
+(()=>{ // Auto-Image-MA-Leader.js — Líder multi-cuenta con estilo/UX del Auto-Image original
 
+// ===== Config & utilidades (compatibles con tu script) =====
+const CONFIG = {
+  COOLDOWN_DEFAULT: 31000,
+  TRANSPARENCY_THRESHOLD: 100,
+  WHITE_THRESHOLD: 250,
+  LOG_INTERVAL: 10,
+  THEME: { primary:'#000', secondary:'#111', accent:'#222', text:'#fff', highlight:'#775ce3', success:'#0f0', error:'#f00', warning:'#ffaa00' }
+};
+const state = {
+  roomId: 'team1',
+  running:false, paused:false, minimized:false,
+  imageLoaded:false, colorsChecked:false, stopFlag:false,
+  startPosition:null, region:null, lastPosition:{x:0,y:0},
+  totalPixels:0, paintedPixels:0,
+  availableColors:[], cooldown:CONFIG.COOLDOWN_DEFAULT,
+  imageData:null, queue:[], inflight:new Map(),
+  strategy:'cola', // 'cola' | 'zonas'
+  zones:4, alias2zone:new Map(),
+};
 const $ = s=>document.querySelector(s);
-const el=(t,c,txt)=>{const e=document.createElement(t); if(c) e.className=c; if(txt) e.textContent=txt; return e;};
-const randId=()=>Math.random().toString(36).slice(2,10);
 const clamp=v=>Math.max(0,Math.min(255,v|0));
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+const colorDist = (a,b)=>Math.sqrt((a[0]-b[0])**2+(a[1]-b[1])**2+(a[2]-b[2])**2);
+function isWhitePixel(r,g,b){ return r>=CONFIG.WHITE_THRESHOLD && g>=CONFIG.WHITE_THRESHOLD && b>=CONFIG.WHITE_THRESHOLD; }
+function extractAvailableColors(){
+  const colorElements = document.querySelectorAll('[id^="color-"]');
+  return Array.from(colorElements)
+    .filter(el => !el.querySelector('svg'))
+    .filter(el => { const id=parseInt(el.id.replace('color-','')); return id!==0 && id!==5; })
+    .map(el => {
+      const id=parseInt(el.id.replace('color-',''));
+      const rgbStr = el.style.backgroundColor.match(/\d+/g);
+      const rgb = rgbStr? rgbStr.map(Number): [0,0,0];
+      return { id, rgb };
+    });
+}
+function findClosestColor(rgb, palette){
+  return palette.reduce((best,c)=>{
+    const d = colorDist(rgb,c.rgb);
+    if(d<best.d) return {id:c.id, d};
+    return best;
+  }, {id:palette[0].id, d:colorDist(rgb,palette[0].rgb)}).id;
+}
 
-const STATE={
-  roomId:'team1',
-  selfId:'leader-'+randId(),
-  palette:null,
-  queue:[],
-  inflight:new Map(),
-  placed:0, failed:0,
-  running:false, paused:false,
-  cfg:{offsetX:0,offsetY:0,scale:1,tolerance:24,dithering:true,jitter:0},
-  startedAt:null
+// ===== WPlace API (igual a tu script) =====
+const WPlace = {
+  async paintPixelInRegion(regionX, regionY, pixelX, pixelY, colorId){
+    try{
+      const res = await fetch(`https://backend.wplace.live/s0/pixel/${regionX}/${regionY}`, {
+        method:'POST',
+        headers:{'Content-Type':'text/plain;charset=UTF-8'},
+        credentials:'include',
+        body: JSON.stringify({ coords:[pixelX,pixelY], colors:[colorId] })
+      });
+      const data = await res.json();
+      return data?.painted===1;
+    }catch{ return false; }
+  },
+  async getCharges(){
+    try{
+      const res = await fetch('https://backend.wplace.live/me', {credentials:'include'});
+      const data = await res.json();
+      return { charges: data.charges?.count||0, cooldown: data.charges?.cooldownMs||CONFIG.COOLDOWN_DEFAULT };
+    }catch{ return {charges:0, cooldown:CONFIG.COOLDOWN_DEFAULT}; }
+  }
 };
 
-let BC=null, LOADED_IMG=null;
-
-function mountUI(){
-  if($('#mai_leader')) return;
-  const box=el('div','mai_panel'); box.id='mai_leader';
-  box.innerHTML=`
-    <div class="hdr"><b>Auto-Image — Líder</b></div>
-    <div class="row">
-      <label>Room <input id="mai_room" value="team1" style="width:120px"></label>
-      <button id="mai_join">Unirme</button>
-    </div>
-    <div class="row">
-      <input type="file" id="mai_file" accept="image/*">
-    </div>
-    <div class="row">
-      <label>OffX <input id="mai_offx" type="number" value="0" style="width:70px"></label>
-      <label>OffY <input id="mai_offy" type="number" value="0" style="width:70px"></label>
-      <label>Escala <input id="mai_scale" type="number" min="1" value="1" style="width:70px"></label>
-    </div>
-    <div class="row">
-      <label>Tolerancia <input id="mai_tol" type="number" min="0" max="128" value="24" style="width:80px"></label>
-      <label><input id="mai_dith" type="checkbox" checked> Dithering</label>
-      <label>Jitter <input id="mai_jit" type="number" min="0" max="1" step="0.1" value="0" style="width:70px"></label>
-    </div>
-    <div class="row">
-      <button id="mai_build">Generar Cola</button>
-      <button id="mai_start" disabled>▶ Iniciar</button>
-      <button id="mai_pause" disabled>⏸</button>
-      <button id="mai_stop" disabled>■</button>
-    </div>
-    <div class="row">
-      <progress id="mai_prog" value="0" max="100" style="width:100%"></progress>
-      <div id="mai_stats"></div>
-    </div>
-    <div class="log" id="mai_log"></div>
-    <style>
-      .mai_panel{position:fixed; top:12px; right:12px; z-index:999999; width:360px; font:12px system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:#111; background:#fff; border:1px solid #ddd; border-radius:12px; box-shadow:0 8px 24px rgba(0,0,0,.15)}
-      .hdr{padding:8px 12px; background:#f6f7f9; border-bottom:1px solid #eee}
-      .row{display:flex; gap:8px; align-items:center; padding:8px; flex-wrap:wrap}
-      .log{font-family:ui-monospace,Menlo,Consolas,monospace; margin:8px; padding:6px; background:#fafafa; border:1px solid #eee; border-radius:8px; max-height:160px; overflow:auto; white-space:pre-wrap}
-      button{cursor:pointer; padding:6px 10px; border-radius:8px; border:1px solid #ddd; background:#fafafa}
-    </style>
-  `;
-  document.body.appendChild(box);
-  $('#mai_join').onclick=joinRoom;
-  $('#mai_file').onchange=onFile;
-  $('#mai_build').onclick=buildQueue;
-  $('#mai_start').onclick=startLeader;
-  $('#mai_pause').onclick=()=>{STATE.paused=!STATE.paused; $('#mai_pause').textContent=STATE.paused?'▶':'⏸';};
-  $('#mai_stop').onclick=stopLeader;
-}
-
-function log(s){ const L=$('#mai_log'); if(L){ L.textContent+=s+'\n'; L.scrollTop=L.scrollHeight; } }
-function setProgress(done,total){
-  const pct = total? Math.round(100*done/total):0;
-  const p=$('#mai_prog'); if(p) p.value=pct;
-  const s=$('#mai_stats');
-  if(s){ s.innerHTML = `Progreso: ${done}/${total} · fallidos:${STATE.failed}`; }
-}
-
-function joinRoom(){
-  const rid=($('#mai_room').value||'team1').trim();
-  STATE.roomId=rid;
+// ===== Broadcast =====
+let BC=null;
+function bcSend(m){ if(!BC) return; m._ts=Date.now(); BC.postMessage(m); }
+function ensureBC(){
   if(BC) BC.close();
-  BC=new BroadcastChannel('ai_room_'+rid);
+  BC = new BroadcastChannel('ai_room_'+state.roomId);
   BC.onmessage = onMsg;
-  log(`Líder unido a sala "${rid}" (${STATE.selfId})`);
-  send({type:'announce', from:STATE.selfId});
+  bcSend({type:'leader_hello'});
 }
-
-function send(msg){ if(!BC) return; msg._ts=Date.now(); BC.postMessage(msg); }
 function onMsg(ev){
   const m=ev.data||{};
-  if(m.type==='hello') send({type:'ack', to:m.from});
-  if(m.type==='reqJob' && STATE.running && !STATE.paused) assignJob(m.from);
-  if(m.type==='jobDone'){ STATE.placed++; setProgress(STATE.placed, STATE.placed + STATE.queue.length); }
-  if(m.type==='jobFailed'){ STATE.failed++; setProgress(STATE.placed, STATE.placed + STATE.queue.length); }
-}
-
-function onFile(ev){
-  const f=ev.target.files?.[0]; if(!f) return;
-  const fr=new FileReader();
-  fr.onload=()=>{ const img=new Image(); img.onload=()=>{ LOADED_IMG=img; log(`Imagen: ${img.width}x${img.height}`); }; img.src=fr.result; };
-  fr.readAsDataURL(f);
-}
-
-async function loadPalette(){
-  const nodes=[...document.querySelectorAll('button,div')];
-  const samples=[];
-  for(const n of nodes){
-    const aria=n.getAttribute?.('aria-label')||'';
-    if(/color|pintar|paint/i.test(aria) || /color/i.test(n.className||'')){
-      const cs=getComputedStyle(n);
-      const bg=cs.backgroundColor||cs.color;
-      const m=bg&&bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
-      if(m) samples.push({el:n,r:+m[1],g:+m[2],b:+m[3]});
+  if(m.type==='worker_hello'){
+    // asignación de zona en modo 'zonas'
+    if(state.strategy==='zonas' && m.alias){
+      if(!state.alias2zone.has(m.alias)){
+        const idx = state.alias2zone.size % Math.max(1,state.zones);
+        state.alias2zone.set(m.alias, idx);
+      }
+    }
+    // publica meta para que el worker conozca región y dims
+    if(state.region && state.imageData){
+      bcSend({type:'leader_meta', region:state.region, dims:{w:state.imageData.width, h:state.imageData.height}});
     }
   }
-  const uniq=[]; const seen=new Set();
-  for(const s of samples){ const k=`${s.r},${s.g},${s.b}`; if(!seen.has(k)){ seen.add(k); uniq.push(s); } }
-  STATE.palette = uniq.map((s,i)=>({id:i,r:s.r,g:s.g,b:s.b,el:s.el}));
-  if(!STATE.palette.length) log('Abre la sección de “Pintar” para detectar la paleta.');
-  else log(`Paleta: ${STATE.palette.length} colores.`);
-}
-function nearestColor(r,g,b,tol){
-  if(!STATE.palette?.length) return null;
-  let best=null, bestD=1e9;
-  for(const c of STATE.palette){ const dr=r-c.r,dg=g-c.g,db=b-c.b; const d=dr*dr+dg*dg+db*db; if(d<bestD){bestD=d;best=c;} }
-  return (Math.sqrt(bestD)>tol)? null : best;
-}
-function floydSteinberg(data,w,h,tol){
-  const out=new Uint8ClampedArray(data), idx=(x,y)=>4*(y*w+x);
-  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-    const i=idx(x,y), a=out[i+3]; if(a<10) continue;
-    const nrgb=nearestColor(out[i],out[i+1],out[i+2],tol);
-    const nr = nrgb?nrgb.r:out[i], ng=nrgb?nrgb.g:out[i+1], nb=nrgb?nrgb.b:out[i+2];
-    const er=out[i]-nr, eg=out[i+1]-ng, eb=out[i+2]-nb;
-    out[i]=nr; out[i+1]=ng; out[i+2]=nb;
-    const add=(x2,y2,f)=>{ if(x2<0||x2>=w||y2<0||y2>=h) return; const j=idx(x2,y2); out[j]+=er*f; out[j+1]+=eg*f; out[j+2]+=eb*f; out[j]=clamp(out[j]); out[j+1]=clamp(out[j+1]); out[j+2]=clamp(out[j+2]);};
-    add(x+1,y  ,7/16); add(x-1,y+1,3/16); add(x,y+1,5/16); add(x+1,y+1,1/16);
+  if(m.type==='reqJob'){
+    if(!state.running || state.paused) return;
+    assignJob(m.to, m.alias);
   }
-  return out;
+  if(m.type==='jobDone'){ state.paintedPixels++; updateProgress(); }
+  if(m.type==='jobFailed'){ updateProgress(); }
 }
 
-async function buildQueue(){
-  if(!LOADED_IMG){ log('Carga una imagen.'); return; }
-  await loadPalette();
-  const offx=STATE.cfg.offsetX= +$('#mai_offx').value|0;
-  const offy=STATE.cfg.offsetY= +$('#mai_offy').value|0;
-  const scale=STATE.cfg.scale  = Math.max(1, +$('#mai_scale').value|0);
-  const tol  =STATE.cfg.tolerance = Math.min(128, Math.max(0, +$('#mai_tol').value|0));
-  STATE.cfg.dithering = $('#mai_dith').checked;
-  STATE.cfg.jitter    = Math.max(0, Math.min(1, +$('#mai_jit').value));
+// ===== UI (estilo de tu Auto-Image: header draggable, botones, etc.) =====
+function mountUI(){
+  if($('#wplace-leader')) return;
 
-  const c=document.createElement('canvas');
-  c.width=(LOADED_IMG.width*scale)|0; c.height=(LOADED_IMG.height*scale)|0;
-  const ctx=c.getContext('2d',{willReadFrequently:true});
-  ctx.imageSmoothingEnabled=(scale>1);
-  ctx.drawImage(LOADED_IMG,0,0,c.width,c.height);
-  const w=c.width, h=c.height, img=ctx.getImageData(0,0,w,h);
-  let data=img.data;
-  if(STATE.cfg.dithering) data=floydSteinberg(data,w,h,tol);
+  // Fuente de iconos como en tu script
+  const fa = document.createElement('link');
+  fa.rel='stylesheet';
+  fa.href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css';
+  document.head.appendChild(fa);
+
+  const css = document.createElement('style');
+  css.textContent = `
+    @keyframes slideIn{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+    #wplace-leader{
+      position:fixed; top:24px; right:24px; width:340px; background:${CONFIG.THEME.primary};
+      color:${CONFIG.THEME.text}; border:1px solid ${CONFIG.THEME.accent}; border-radius:8px;
+      box-shadow:0 10px 24px rgba(0,0,0,.45); z-index:99999; animation:slideIn .3s ease-out; overflow:hidden
+    }
+    #wplace-leader .hdr{
+      padding:12px 14px; background:${CONFIG.THEME.secondary}; color:${CONFIG.THEME.highlight};
+      display:flex; align-items:center; justify-content:space-between; cursor:move; user-select:none
+    }
+    #wplace-leader .body{ padding:12px }
+    .row{ display:flex; gap:8px; align-items:center; margin:8px 0; flex-wrap:wrap }
+    .tag{ background:${CONFIG.THEME.secondary}; padding:4px 8px; border-radius:6px; font-size:12px; opacity:.9 }
+    .btn{ padding:8px 10px; border:none; border-radius:6px; cursor:pointer; font-weight:600 }
+    .btn:disabled{opacity:.5; cursor:not-allowed}
+    .b1{ background:${CONFIG.THEME.accent}; color:#fff }
+    .b2{ background:${CONFIG.THEME.success}; color:#000 }
+    .b3{ background:${CONFIG.THEME.error}; color:#fff }
+    .b4{ background:${CONFIG.THEME.highlight}; color:#000 }
+    .box{ background:${CONFIG.THEME.secondary}; border-radius:6px; padding:10px }
+    progress{ width:100% }
+    .mini{font-size:12px; opacity:.85}
+  `;
+  document.head.appendChild(css);
+
+  const root = document.createElement('div');
+  root.id='wplace-leader';
+  root.innerHTML = `
+    <div class="hdr">
+      <div><i class="fa-solid fa-users"></i> Auto-Image — Líder</div>
+      <div class="row" style="margin:0">
+        <span class="tag" id="roomTag">Sala: ${state.roomId}</span>
+        <button class="btn" id="minBtn" title="Minimizar"><i class="fa-solid fa-minus"></i></button>
+      </div>
+    </div>
+    <div class="body">
+      <div class="row">
+        <label class="mini">Sala</label>
+        <input id="roomInput" value="${state.roomId}" style="flex:1;min-width:120px;padding:6px;border-radius:6px;border:1px solid ${CONFIG.THEME.accent};background:#000;color:#fff"/>
+        <button class="btn b1" id="roomApply">Cambiar</button>
+      </div>
+
+      <div class="row">
+        <button class="btn b1" id="checkColors"><i class="fa-solid fa-palette"></i> Detectar Colores</button>
+        <button class="btn" id="uploadBtn"><i class="fa-solid fa-upload"></i> Cargar Imagen</button>
+        <button class="btn b4" id="selectPos"><i class="fa-solid fa-crosshairs"></i> Posición</button>
+      </div>
+
+      <div class="row">
+        <select id="strategySel" style="flex:1;min-width:140px;padding:6px;border-radius:6px;background:#000;color:#fff;border:1px solid ${CONFIG.THEME.accent}">
+          <option value="cola" selected>Reparto: Cola global</option>
+          <option value="zonas">Reparto: Por zonas</option>
+        </select>
+        <label class="mini">Zonas</label>
+        <input id="zonesInp" type="number" min="1" value="4" style="width:70px;padding:6px;border-radius:6px;border:1px solid ${CONFIG.THEME.accent};background:#000;color:#fff"/>
+      </div>
+
+      <div class="row">
+        <button class="btn b2" id="buildQueue"><i class="fa-solid fa-list"></i> Generar Cola</button>
+        <button class="btn b2" id="startBtn" disabled><i class="fa-solid fa-play"></i> Iniciar</button>
+        <button class="btn" id="pauseBtn" disabled>⏸</button>
+        <button class="btn b3" id="stopBtn" disabled>■</button>
+      </div>
+
+      <div class="box">
+        <progress id="prog" value="0" max="100"></progress>
+        <div class="mini" id="stats">—</div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(root);
+
+  // drag (como tu Auto-Image)
+  const header = root.querySelector('.hdr');
+  let pos1=0,pos2=0,pos3=0,pos4=0;
+  header.onmousedown = e=>{
+    if(e.target.id==='minBtn') return;
+    e.preventDefault(); pos3=e.clientX; pos4=e.clientY;
+    document.onmouseup=()=>{document.onmouseup=null; document.onmousemove=null;};
+    document.onmousemove=ev=>{
+      ev.preventDefault(); pos1=pos3-ev.clientX; pos2=pos4-ev.clientY; pos3=ev.clientX; pos4=ev.clientY;
+      root.style.top=(root.offsetTop-pos2)+"px"; root.style.left=(root.offsetLeft-pos1)+"px";
+    };
+  };
+
+  // UI events
+  $('#minBtn').onclick=()=>{
+    state.minimized=!state.minimized;
+    root.querySelector('.body').style.display = state.minimized?'none':'block';
+    $('#minBtn').innerHTML = state.minimized? '<i class="fa-solid fa-expand"></i>':'<i class="fa-solid fa-minus"></i>';
+  };
+  $('#roomApply').onclick = ()=>{
+    state.roomId = ($('#roomInput').value||'team1').trim();
+    $('#roomTag').textContent = 'Sala: '+state.roomId;
+    ensureBC();
+  };
+  $('#checkColors').onclick = ()=>{
+    state.availableColors = extractAvailableColors();
+    state.colorsChecked = state.availableColors.length>0;
+    updateStats('Colores: '+state.availableColors.length);
+    if(!state.colorsChecked) alert('Abrí la paleta de colores del juego y volvé a intentar.');
+  };
+  $('#uploadBtn').onclick = async ()=>{
+    const input = document.createElement('input');
+    input.type='file'; input.accept='image/png,image/jpeg';
+    input.onchange = async ()=>{
+      const fr=new FileReader();
+      fr.onload = async ()=>{
+        const img=new Image();
+        img.onload=()=>{
+          // volcado a canvas
+          const c=document.createElement('canvas');
+          c.width=img.width; c.height=img.height;
+          const ctx=c.getContext('2d'); ctx.drawImage(img,0,0);
+          const pixels = ctx.getImageData(0,0,c.width,c.height).data;
+          // conteo válidos
+          let total=0;
+          for(let y=0;y<c.height;y++) for(let x=0;x<c.width;x++){
+            const i=4*(y*c.width+x); const a=pixels[i+3];
+            if(a<CONFIG.TRANSPARENCY_THRESHOLD) continue;
+            const r=pixels[i],g=pixels[i+1],b=pixels[i+2];
+            if(isWhitePixel(r,g,b)) continue; total++;
+          }
+          state.imageData={width:c.width,height:c.height,pixels,totalPixels:total};
+          state.totalPixels=total; state.paintedPixels=0; state.imageLoaded=true;
+          updateProgress();
+        };
+        img.src = fr.result;
+      };
+      fr.readAsDataURL(input.files[0]);
+    };
+    input.click();
+  };
+  $('#selectPos').onclick = selectPositionFlow;
+  $('#strategySel').onchange = ()=>state.strategy=$('#strategySel').value;
+  $('#zonesInp').onchange = ()=>state.zones=Math.max(1, +$('#zonesInp').value|0);
+  $('#buildQueue').onclick = buildQueue;
+  $('#startBtn').onclick = startLeader;
+  $('#pauseBtn').onclick = ()=>{ state.paused=!state.paused; $('#pauseBtn').textContent=state.paused?'▶':'⏸'; };
+  $('#stopBtn').onclick = stopLeader;
+
+  // autoconectar
+  ensureBC();
+  updateStats('Conectado a sala "'+state.roomId+'".');
+}
+
+function updateProgress(){
+  const p = (state.totalPixels? Math.round(100*state.paintedPixels/state.totalPixels):0);
+  $('#prog').value=p;
+  $('#stats').textContent = `Progreso ${p}% · pintados ${state.paintedPixels}/${state.totalPixels} · en cola ${state.queue.length}`;
+}
+function updateStats(msg){ $('#stats').textContent = msg; }
+
+// ===== Selección de región/posición (igual mecanismo que tu script) =====
+async function selectPositionFlow(){
+  const originalFetch = window.fetch;
+  updateStats('Pintá un pixel donde deba comenzar el arte…');
+  window.fetch = async (url, options)=>{
+    if(typeof url==='string' && url.includes('https://backend.wplace.live/s0/pixel/') && options?.method?.toUpperCase()==='POST'){
+      try{
+        const res = await originalFetch(url, options);
+        const clone = res.clone(); const data = await clone.json();
+        if(data?.painted===1){
+          const m = url.match(/\/pixel\/(\d+)\/(\d+)/);
+          if(m){ state.region={x:parseInt(m[1]),y:parseInt(m[2])}; }
+          const body = JSON.parse(options.body||'{}');
+          if(body?.coords){ state.startPosition={x:body.coords[0], y:body.coords[1]}; state.lastPosition={x:0,y:0}; }
+          window.fetch=originalFetch;
+          if(state.region && state.startPosition) {
+            updateStats(`Región ${state.region.x},${state.region.y} · Inicio ${state.startPosition.x},${state.startPosition.y}`);
+            // anuncia meta a los workers
+            bcSend({type:'leader_meta', region:state.region, dims: state.imageData? {w:state.imageData.width,h:state.imageData.height}:null});
+          }
+        }
+        return res;
+      }catch{ return originalFetch(url,options); }
+    }
+    return originalFetch(url,options);
+  };
+  // timeout 2 min
+  setTimeout(()=>{ window.fetch=originalFetch; }, 120000);
+}
+
+// ===== Construir cola =====
+function buildQueue(){
+  if(!state.colorsChecked || !state.imageLoaded || !state.startPosition || !state.region){
+    alert('Falta detectar colores, cargar imagen y seleccionar posición.');
+    return;
+  }
+  const {width,height,pixels} = state.imageData;
+  const startX = state.startPosition.x, startY = state.startPosition.y;
+  const pal = state.availableColors;
 
   const q=[];
-  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-    const i=4*(y*w+x), a=data[i+3]; if(a<10) continue;
-    const r=data[i],g=data[i+1],b=data[i+2];
-    const nc=nearestColor(r,g,b,tol); if(!nc) continue;
-    const jx=STATE.cfg.jitter?(Math.random()*STATE.cfg.jitter*2-STATE.cfg.jitter):0;
-    const jy=STATE.cfg.jitter?(Math.random()*STATE.cfg.jitter*2-STATE.cfg.jitter):0;
-    q.push({x:(x+offx+jx)|0, y:(y+offy+jy)|0, color:{r:nc.r,g:nc.g,b:nc.b}});
+  for(let y=0;y<height;y++){
+    for(let x=0;x<width;x++){
+      const i=4*(y*width+x);
+      const a=pixels[i+3]; if(a<CONFIG.TRANSPARENCY_THRESHOLD) continue;
+      const r=pixels[i],g=pixels[i+1],b=pixels[i+2];
+      if(isWhitePixel(r,g,b)) continue;
+      const colorId = findClosestColor([r,g,b], pal);
+      const absX = startX + x, absY = startY + y;
+      const zone = Math.floor((x / width) * Math.max(1,state.zones));
+      q.push({x:absX, y:absY, colorId, zone});
+    }
   }
-  // orden serpentina por filas
-  q.sort((A,B)=> (A.y-B.y) || ((A.y&1)?(B.x-A.x):(A.x-B.x)));
-  STATE.queue=q; STATE.placed=0; STATE.failed=0; STATE.startedAt=Date.now();
-  setProgress(0, q.length);
-  log(`Cola creada: ${q.length} píxeles`);
-  $('#mai_start').disabled=false; $('#mai_pause').disabled=false; $('#mai_stop').disabled=false;
+  // orden serpentina por filas para mejorar resultado visual
+  q.sort((A,B)=> (A.y-B.y) || ((A.y&1)? (B.x-A.x):(A.x-B.x)));
+  state.queue=q;
+  state.paintedPixels=0;
+  updateStats(`Cola creada: ${q.length} píxeles`);
+  updateProgress();
+  $('#startBtn').disabled=false; $('#pauseBtn').disabled=false; $('#stopBtn').disabled=false;
 }
 
+// ===== Asignación de trabajos =====
 function startLeader(){
-  STATE.running=true; STATE.paused=false;
-  log('Líder iniciado. Trabajadores pueden pedir trabajo.');
-  send({type:'leaderStatus', done:STATE.placed, total:STATE.placed+STATE.queue.length});
+  if(!state.queue.length){ alert('Generá la cola primero.'); return; }
+  state.running=true; state.paused=false;
+  updateStats('Líder iniciado. Trabajadores pueden pedir trabajo.');
+  // broadcast meta por si alguien llega tarde
+  bcSend({type:'leader_meta', region:state.region, dims:{w:state.imageData.width,h:state.imageData.height}});
 }
-function stopLeader(){
-  STATE.running=false; STATE.paused=false;
-  log('Líder detenido.');
+function stopLeader(){ state.running=false; state.paused=false; updateStats('Líder detenido.'); }
+
+function assignJob(workerId, alias){
+  let job=null;
+  if(state.strategy==='zonas' && alias){
+    const zone = state.alias2zone.get(alias);
+    if(zone!=null){
+      const idx = state.queue.findIndex(p=>p.zone===zone);
+      if(idx>=0){ job = state.queue.splice(idx,1)[0]; }
+    }
+  }
+  if(!job){ job = state.queue.shift(); }
+  if(!job){ bcSend({type:'noJob', to:workerId}); return; }
+  const jobId = 'j-'+Math.random().toString(36).slice(2,10);
+  state.inflight.set(jobId,job);
+  bcSend({type:'grantJob', to:workerId, job:{id:jobId, x:job.x, y:job.y, colorId:job.colorId, region:state.region}});
+  updateProgress();
 }
 
-function assignJob(workerId){
-  if(!STATE.queue.length){ send({type:'noJob', to:workerId}); return; }
-  const job=STATE.queue.shift();
-  const jobId='j-'+randId();
-  STATE.inflight.set(jobId, job);
-  send({type:'grantJob', to:workerId, job:{id:jobId, x:job.x, y:job.y, color:job.color}});
-  setProgress(STATE.placed, STATE.placed + STATE.queue.length);
-}
-
+// ===== Init =====
 mountUI();
 
 })();
