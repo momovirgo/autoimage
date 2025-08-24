@@ -1,177 +1,132 @@
-(()=>{
-// Auto-Image-MA-Worker.js — Multi-Account Worker for wplace.live
+(()=>{ // Auto-Image-MA-Worker.js — Trabajador multi-cuenta con API wplace y UI draggable
 
+const CONFIG = { COOLDOWN_DEFAULT:31000, THEME:{ primary:'#000', secondary:'#111', accent:'#222', text:'#fff', highlight:'#775ce3' } };
+const state = { roomId:'team1', alias:'user-'+Math.random().toString(36).slice(2,6), charges:0, cooldown:CONFIG.COOLDOWN_DEFAULT, paused:false, region:null };
 const $ = s=>document.querySelector(s);
-const el=(t,c,txt)=>{const e=document.createElement(t); if(c) e.className=c; if(txt) e.textContent=txt; return e;};
 
-const STATE={
-  roomId:'team1',
-  alias:'user-'+Math.random().toString(36).slice(2,6),
-  selfId:'worker-'+Math.random().toString(36).slice(2,10),
-  token:'',
-  useToken:false,
-  cooldownMs:1500, lastPlaceTs:0, paused:false,
-  palette:null
+const WPlace = {
+  async getCharges(){ try{ const r=await fetch('https://backend.wplace.live/me',{credentials:'include'}); const j=await r.json(); return {charges:j.charges?.count||0, cooldown:j.charges?.cooldownMs||CONFIG.COOLDOWN_DEFAULT}; }catch{ return {charges:0,cooldown:CONFIG.COOLDOWN_DEFAULT}; } },
+  async paint(region,x,y,colorId){
+    try{
+      const r = await fetch(`https://backend.wplace.live/s0/pixel/${region.x}/${region.y}`,{
+        method:'POST', headers:{'Content-Type':'text/plain;charset=UTF-8'}, credentials:'include',
+        body: JSON.stringify({coords:[x,y], colors:[colorId]})
+      });
+      const j = await r.json(); return j?.painted===1;
+    }catch{ return false; }
+  }
 };
 
+// ===== Broadcast =====
 let BC=null;
-
-function mountUI(){
-  if($('#maw_worker')) return;
-  const box=el('div','maw_panel'); box.id='maw_worker';
-  box.innerHTML=`
-    <div class="hdr"><b>Auto-Image — Trabajador</b></div>
-    <div class="row">
-      <label>Room <input id="maw_room" value="team1" style="width:120px"></label>
-      <label>Alias <input id="maw_alias" value="${STATE.alias}" style="width:120px"></label>
-      <button id="maw_join">Unirme</button>
-    </div>
-    <div class="row">
-      <label><input id="maw_usertk" type="checkbox"> Usar token (experimental)</label>
-      <input id="maw_token" placeholder="pega tu token aquí" style="flex:1; min-width:160px">
-    </div>
-    <div class="row">
-      <button id="maw_pause">⏸ Pausa</button>
-    </div>
-    <div class="row">
-      <div id="maw_stats">cooldown≈—</div>
-    </div>
-    <div class="log" id="maw_log"></div>
-    <style>
-      .maw_panel{position:fixed; top:12px; left:12px; z-index:999999; width:360px; font:12px system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:#111; background:#fff; border:1px solid #ddd; border-radius:12px; box-shadow:0 8px 24px rgba(0,0,0,.15)}
-      .hdr{padding:8px 12px; background:#f6f7f9; border-bottom:1px solid #eee}
-      .row{display:flex; gap:8px; align-items:center; padding:8px; flex-wrap:wrap}
-      .log{font-family:ui-monospace,Menlo,Consolas,monospace; margin:8px; padding:6px; background:#fafafa; border:1px solid #eee; border-radius:8px; max-height:160px; overflow:auto; white-space:pre-wrap}
-      button{cursor:pointer; padding:6px 10px; border-radius:8px; border:1px solid #ddd; background:#fafafa}
-      #maw_token{font-family:ui-monospace,Menlo,Consolas,monospace}
-    </style>
-  `;
-  document.body.appendChild(box);
-  $('#maw_join').onclick = joinRoom;
-  $('#maw_pause').onclick= ()=>{STATE.paused=!STATE.paused; $('#maw_pause').textContent=STATE.paused?'▶ Reanudar':'⏸ Pausa'; if(!STATE.paused) pumpWorker();};
-  $('#maw_usertk').onchange=()=> STATE.useToken = $('#maw_usertk').checked;
-  $('#maw_token').oninput = ()=> STATE.token = $('#maw_token').value.trim();
-}
-
-function log(s){ const L=$('#maw_log'); if(L){ L.textContent+=s+'\n'; L.scrollTop=L.scrollHeight; } }
-function stats(){ const S=$('#maw_stats'); if(S){ S.textContent = `alias:${STATE.alias} · cooldown≈${STATE.cooldownMs}ms`; } }
-
-function joinRoom(){
-  STATE.roomId = ($('#maw_room').value||'team1').trim();
-  STATE.alias  = ($('#maw_alias').value||STATE.alias).trim();
+function bcSend(m){ if(!BC) return; m._ts=Date.now(); BC.postMessage(m); }
+function ensureBC(){
   if(BC) BC.close();
-  BC=new BroadcastChannel('ai_room_'+STATE.roomId);
+  BC = new BroadcastChannel('ai_room_'+state.roomId);
   BC.onmessage = onMsg;
-  log(`Trabajador "${STATE.alias}" unido a sala "${STATE.roomId}" (${STATE.selfId})`);
-  send({type:'hello', from:STATE.selfId, alias:STATE.alias});
-  pumpWorker();
+  bcSend({type:'worker_hello', alias:state.alias});
 }
-
-function send(m){ if(!BC) return; m._ts=Date.now(); BC.postMessage(m); }
 function onMsg(ev){
   const m=ev.data||{};
-  if(m.type==='ack' && m.to===STATE.selfId){ log('Líder activo.'); }
-  if(m.type==='grantJob' && m.to===STATE.selfId){ doJob(m.job); }
-  if(m.type==='leaderStatus'){ /* opcional: mostrar progreso global */ }
-}
-
-function readCooldownMs(){
-  const cand=[...document.querySelectorAll('*')].find(n=>{
-    const t=n.textContent||''; return /cooldown|en\s+\d+(?:\.\d+)?s|seg/i.test(t);
-  });
-  if(cand){
-    const m=(cand.textContent||'').match(/(\d+(?:\.\d+)?)\s*s/);
-    if(m){ STATE.cooldownMs = Math.max(500, Math.round(+m[1]*1000)); }
+  if(m.type==='leader_meta'){ if(m.region) state.region=m.region; }
+  if(m.type==='grantJob' && m.to===selfId){
+    if(!state.region) state.region = m.job.region; // por si no llegó meta aún
+    doJob(m.job);
   }
-  stats();
 }
+const selfId = 'w-'+Math.random().toString(36).slice(2,9);
 
-async function loadPalette(){
-  if(STATE.palette?.length) return;
-  const nodes=[...document.querySelectorAll('button,div')];
-  const samples=[];
-  for(const n of nodes){
-    const aria=n.getAttribute?.('aria-label')||'';
-    if(/color|pintar|paint/i.test(aria) || /color/i.test(n.className||'')){
-      const cs=getComputedStyle(n);
-      const bg=cs.backgroundColor||cs.color;
-      const mm=bg&&bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
-      if(mm) samples.push({el:n,r:+mm[1],g:+mm[2],b:+mm[3]});
-    }
+// ===== UI =====
+function mountUI(){
+  if($('#wplace-worker')) return;
+
+  const fa=document.createElement('link'); fa.rel='stylesheet';
+  fa.href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css'; document.head.appendChild(fa);
+  const css=document.createElement('style'); css.textContent=`
+    #wplace-worker{position:fixed;top:24px;left:24px;width:320px;background:${CONFIG.THEME.primary};color:${CONFIG.THEME.text};border:1px solid ${CONFIG.THEME.accent};border-radius:8px;box-shadow:0 10px 24px rgba(0,0,0,.45);z-index:99999;overflow:hidden}
+    #wplace-worker .hdr{padding:12px 14px;background:${CONFIG.THEME.secondary};color:${CONFIG.THEME.highlight};display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none}
+    #wplace-worker .body{padding:12px}
+    .row{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
+    .btn{padding:8px 10px;border:none;border-radius:6px;cursor:pointer;background:${CONFIG.THEME.accent};color:#fff}
+    .tag{background:${CONFIG.THEME.secondary};padding:4px 8px;border-radius:6px;font-size:12px}
+    .mini{font-size:12px;opacity:.85}
+  `; document.head.appendChild(css);
+
+  const root=document.createElement('div');
+  root.id='wplace-worker';
+  root.innerHTML=`
+    <div class="hdr"><div><i class="fa-solid fa-user"></i> Auto-Image — Trabajador</div><div><span class="tag" id="roomTag">Sala: ${state.roomId}</span></div></div>
+    <div class="body">
+      <div class="row">
+        <label class="mini">Alias</label>
+        <input id="aliasInp" value="${state.alias}" style="flex:1;min-width:120px;padding:6px;border-radius:6px;border:1px solid ${CONFIG.THEME.accent};background:#000;color:#fff"/>
+      </div>
+      <div class="row">
+        <label class="mini">Sala</label>
+        <input id="roomInp" value="${state.roomId}" style="flex:1;min-width:120px;padding:6px;border-radius:6px;border:1px solid ${CONFIG.THEME.accent};background:#000;color:#fff"/>
+        <button class="btn" id="applyBtn">Conectar</button>
+      </div>
+      <div class="row mini" id="stats">charges: — · cooldown: —</div>
+      <div class="row">
+        <button class="btn" id="pauseBtn">⏸ Pausa</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(root);
+
+  // drag
+  const header=root.querySelector('.hdr'); let p1=0,p2=0,p3=0,p4=0;
+  header.onmousedown = e=>{ e.preventDefault(); p3=e.clientX;p4=e.clientY;
+    document.onmouseup=()=>{document.onmouseup=null;document.onmousemove=null;};
+    document.onmousemove=ev=>{ev.preventDefault(); p1=p3-ev.clientX; p2=p4-ev.clientY; p3=ev.clientX; p4=ev.clientY;
+      root.style.top=(root.offsetTop-p2)+"px"; root.style.left=(root.offsetLeft-p1)+"px";
+    };
+  };
+
+  // events
+  $('#applyBtn').onclick=()=>{
+    state.alias = ($('#aliasInp').value||state.alias).trim();
+    state.roomId = ($('#roomInp').value||state.roomId).trim();
+    $('#roomTag').textContent = 'Sala: '+state.roomId;
+    ensureBC();
+  };
+  $('#pauseBtn').onclick=()=>{ state.paused=!state.paused; $('#pauseBtn').textContent = state.paused?'▶ Reanudar':'⏸ Pausa'; if(!state.paused) pump(); };
+
+  // auto connect
+  ensureBC(); updateStats();
+  pump();
+}
+function updateStats(){ $('#stats').textContent = `charges: ${state.charges} · cooldown: ${state.cooldown}ms`; }
+
+// ===== Loop del trabajador =====
+async function pump(){
+  if(state.paused) return;
+  // actualizar charges antes de pedir trabajo
+  const ch = await WPlace.getCharges();
+  state.charges = Math.floor(ch.charges); state.cooldown = ch.cooldown; updateStats();
+
+  if(state.charges<1){
+    // esperar cooldown y volver
+    await sleep(state.cooldown);
+    return pump();
   }
-  const uniq=[]; const seen=new Set();
-  for(const s of samples){ const k=`${s.r},${s.g},${s.b}`; if(!seen.has(k)){ seen.add(k); uniq.push(s); } }
-  STATE.palette = uniq.map((s,i)=>({id:i,r:s.r,g:s.g,b:s.b,el:s.el}));
-  if(!STATE.palette.length) log('Abre “Pintar” para detectar paleta.');
-}
-
-async function selectColorRGB(rgb){
-  await loadPalette();
-  let best=null, bestD=1e9;
-  for(const c of STATE.palette||[]){
-    const dr=rgb.r-c.r, dg=rgb.g-c.g, db=rgb.b-c.b; const d=dr*dr+dg*dg+db*db;
-    if(d<bestD){ bestD=d; best=c; }
-  }
-  if(best?.el) best.el.click();
-}
-
-async function placePixelWithClick(x,y,rgb){
-  await selectColorRGB(rgb);
-  const canvas=document.querySelector('canvas');
-  if(!canvas) throw new Error('Canvas no encontrado');
-  const rect=canvas.getBoundingClientRect();
-  const cx = rect.left + Math.max(0, Math.min(rect.width-1, x));
-  const cy = rect.top  + Math.max(0, Math.min(rect.height-1, y));
-  canvas.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,clientX:cx,clientY:cy}));
-  canvas.dispatchEvent(new MouseEvent('mouseup'  ,{bubbles:true,clientX:cx,clientY:cy}));
-  readCooldownMs();
-}
-
-async function placePixelWithToken(token, x,y,rgb){
-  // ✳️ RELLENA AQUÍ si tienes endpoint oficial/permitido por wplace:
-  // Ejemplo (ficticio):
-  // const res = await fetch("https://wplace.live/api/paint", {
-  //   method:"POST",
-  //   headers:{ "Authorization":"Bearer "+token, "Content-Type":"application/json" },
-  //   body: JSON.stringify({ x, y, color: rgb })
-  // });
-  // if(!res.ok) throw new Error("API "+res.status);
-  // // Si la respuesta trae cooldown, úsalo para ajustar STATE.cooldownMs
-  // const j=await res.json(); if(j.cooldown) STATE.cooldownMs = Math.max(500, j.cooldown*1000);
-  // Por defecto, si no hay endpoint, lanzamos para que caiga al modo click:
-  throw new Error("API token no configurada");
-}
-
-function pumpWorker(){
-  if(STATE.paused) return;
-  const now=Date.now();
-  const wait = Math.max(0, (STATE.lastPlaceTs + STATE.cooldownMs) - now);
-  if(wait>0){ setTimeout(pumpWorker, wait); return; }
-  send({type:'reqJob', from:STATE.selfId, alias:STATE.alias});
+  bcSend({type:'reqJob', to:selfId, alias:state.alias});
 }
 
 async function doJob(job){
   try{
-    if(STATE.useToken && STATE.token){
-      try{
-        await placePixelWithToken(STATE.token, job.x, job.y, job.color);
-      }catch(e){
-        log('Fallo API token ('+(e?.message||e)+') → usando clicks.');
-        await placePixelWithClick(job.x, job.y, job.color);
-      }
-    }else{
-      await placePixelWithClick(job.x, job.y, job.color);
-    }
-    STATE.lastPlaceTs=Date.now();
-    send({type:'jobDone', id:job.id, from:STATE.selfId, alias:STATE.alias});
-  }catch(err){
-    send({type:'jobFailed', id:job.id, from:STATE.selfId, alias:STATE.alias, error:(err?.message||'err')});
-  }finally{
-    setTimeout(pumpWorker, Math.max(150, STATE.cooldownMs*0.95));
+    if(!state.region) state.region = job.region;
+    // pintar
+    const ok = await WPlace.paint(state.region, job.x, job.y, job.colorId);
+    if(ok){ state.charges = Math.max(0,state.charges-1); bcSend({type:'jobDone', id:job.id, from:selfId}); }
+    else{ bcSend({type:'jobFailed', id:job.id, from:selfId}); }
+  }catch{ bcSend({type:'jobFailed', id:job.id, from:selfId}); }
+  finally{
+    setTimeout(pump, Math.max(200, state.cooldown*0.95));
   }
 }
 
+// ===== Init =====
 mountUI();
-stats();
 
 })();
